@@ -1,0 +1,35 @@
+name: lead_gen_fr
+description: "French B2B lead generation pipeline"
+mode: agentic
+budget_eur: 0.05
+locale: fr
+gdpr_level: strict
+
+agents:
+  - id: scraper
+    role: "Lead Prospector"
+    goal: "Find business contacts in target city and niche"
+    backstory: "Expert in French B2B prospecting"
+    model: auto
+    tools: [web_search]
+    max_iter: 10
+
+  - id: qualifier
+    role: "Lead Qualifier"
+    goal: "Score and qualify leads by relevance"
+    backstory: "B2B sales specialist"
+    model: auto
+    reasoning: true
+
+  - id: copywriter
+    role: "Outreach Copywriter"
+    goal: "Write personalized French outreach messages"
+    backstory: "Native French copywriter specializing in B2B"
+    model: auto
+    locale: fr
+
+handoffs:
+  - from: "Lead Prospector"
+    to: "Lead Qualifier"
+  - from: "Lead Qualifier"
+    to: "Outreach Copywriter"

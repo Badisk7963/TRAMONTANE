@@ -1,0 +1,35 @@
+name: document_analysis
+description: "GDPR-compliant EU document analysis pipeline"
+mode: agentic
+budget_eur: 0.20
+locale: fr
+gdpr_level: strict
+
+agents:
+  - id: extractor
+    role: "Document Extractor"
+    goal: "Extract text, tables, and key data from documents"
+    backstory: "Expert in document processing and OCR"
+    model: pixtral-large
+    tools: [document_library]
+    max_iter: 10
+
+  - id: analyzer
+    role: "Legal Analyst"
+    goal: "Analyze content for key clauses, risks, obligations"
+    backstory: "French legal analyst with EU law expertise"
+    model: magistral-medium
+    reasoning: true
+    locale: fr
+
+  - id: summarizer
+    role: "Executive Summarizer"
+    goal: "Produce bilingual FR/EN executive summary"
+    backstory: "Senior consultant, bilingual FR/EN"
+    model: mistral-small
+
+handoffs:
+  - from: "Document Extractor"
+    to: "Legal Analyst"
+  - from: "Legal Analyst"
+    to: "Executive Summarizer"

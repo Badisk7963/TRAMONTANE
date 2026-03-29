@@ -1,0 +1,16 @@
+services:
+  tramontane:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
+      - TRAMONTANE_ENV=production
+      - TRAMONTANE_DB=/data/tramontane.db
+    volumes:
+      - tramontane_data:/data
+      - ./pipelines:/app/pipelines:ro
+    restart: unless-stopped
+
+volumes:
+  tramontane_data:

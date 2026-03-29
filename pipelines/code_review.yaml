@@ -1,0 +1,35 @@
+name: code_review
+description: "Automated code review and security audit"
+mode: agentic
+budget_eur: 0.10
+locale: en
+gdpr_level: none
+
+agents:
+  - id: reviewer
+    role: "Senior Code Reviewer"
+    goal: "Review code for bugs, performance, and best practices"
+    backstory: "10 years Python/TypeScript, open source contributor"
+    model: devstral-small
+    tools: [code_interpreter]
+    reasoning: true
+    max_iter: 20
+
+  - id: security
+    role: "Security Auditor"
+    goal: "Identify security vulnerabilities and OWASP issues"
+    backstory: "Certified security engineer"
+    model: magistral-small
+    reasoning: true
+
+  - id: reporter
+    role: "Technical Writer"
+    goal: "Produce structured review report with priorities"
+    backstory: "Technical documentation specialist"
+    model: mistral-small
+
+handoffs:
+  - from: "Senior Code Reviewer"
+    to: "Security Auditor"
+  - from: "Security Auditor"
+    to: "Technical Writer"

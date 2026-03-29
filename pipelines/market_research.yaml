@@ -1,0 +1,37 @@
+name: market_research
+description: "Deep EU market intelligence pipeline"
+mode: agentic
+budget_eur: 0.15
+locale: en
+gdpr_level: standard
+
+agents:
+  - id: researcher
+    role: "Senior Market Researcher"
+    goal: "Find and synthesize current market intelligence"
+    backstory: "Expert in EU tech market analysis with 10 years experience"
+    model: auto
+    tools: [web_search]
+    max_iter: 15
+    streaming: true
+
+  - id: analyst
+    role: "Data Analyst"
+    goal: "Structure and analyze the research data"
+    backstory: "Quantitative analyst specializing in market sizing"
+    model: auto
+    tools: [code_interpreter]
+    reasoning: true
+
+  - id: writer
+    role: "Research Writer"
+    goal: "Produce executive-grade report"
+    backstory: "Senior technology journalist and analyst"
+    model: auto
+    streaming: true
+
+handoffs:
+  - from: "Senior Market Researcher"
+    to: "Data Analyst"
+  - from: "Data Analyst"
+    to: "Research Writer"

@@ -1,0 +1,28 @@
+# Environment
+.env
+.venv/
+
+# Python
+__pycache__/
+*.py[oc]
+*.egg-info/
+build/
+dist/
+wheels/
+
+# Databases
+*.db
+tramontane_state.db
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Temp
+/tmp/

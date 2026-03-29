@@ -1,0 +1,58 @@
+# Tramontane Router Rules
+# Human-editable routing configuration.
+# Model aliases map to entries in tramontane.router.models.MISTRAL_MODELS.
+
+routing:
+  code:
+    default: devstral-small       # all code tasks by default
+    complex: devstral-2           # complexity >= 4
+    local: devstral-small         # --local flag maps to Ollama
+
+  reasoning:
+    default: magistral-small      # CoT, planning
+    deep: magistral-medium        # complexity >= 4
+    local: magistral-small
+
+  research:
+    default: mistral-small        # general research
+    frontier: mistral-large       # complexity >= 3 + task=research
+
+  bulk:
+    default: ministral-7b         # extraction, batch processing
+    fast: ministral-3b            # ultra-low-cost bulk
+
+  vision:
+    default: pixtral-large        # any image/multimodal input
+
+  voice:
+    default: voxtral-mini         # voice/audio transcription
+
+  general:
+    default: mistral-small        # fallback for unclassified tasks
+
+# Function calling: which model handles tool invocations
+function_calling:
+  default: ministral-7b           # all tool calls route here
+  reasoning_required: magistral-small  # unless reasoning is needed
+
+# Classification: intake model that decides task type + complexity
+classification:
+  model: ministral-3b             # always used for intake triage
+
+# Budget: when a call would exceed budget, downgrade through this list
+budget:
+  downgrade_order:
+    - mistral-small
+    - ministral-7b
+    - ministral-3b
+
+# Locale: prefer multilingual-strong models for these locales
+locale_preference:
+  strong_multilingual:
+    - mistral-small
+    - mistral-large
+
+# Defaults applied when not overridden per-agent or per-pipeline
+defaults:
+  max_output_tokens_estimate: 1000
+  budget_ceiling_eur: null        # null = no ceiling

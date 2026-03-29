@@ -26,3 +26,8 @@ tramontane_state.db
 
 # Temp
 /tmp/
+
+# Session state
+.remember/
+.serena/
+.claude/

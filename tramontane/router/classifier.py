@@ -230,7 +230,7 @@ class TaskClassifier:
     ) -> ClassificationResult:
         """Classify using a real Ministral-3B API call."""
         try:
-            from mistralai import Mistral
+            from mistralai.client import Mistral
 
             client = Mistral(api_key=self._api_key)
             user_content = prompt
@@ -239,7 +239,7 @@ class TaskClassifier:
 
             response = await client.chat.complete_async(
                 model="ministral-3b-latest",
-                messages=[
+                messages=[  # type: ignore[arg-type]
                     {"role": "system", "content": _CLASSIFIER_SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
                 ],

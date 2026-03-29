@@ -1,7 +1,7 @@
 ---
 title: TRAMONTANE — Mistral Router Demo
 emoji: "\U0001F32C\uFE0F"
-colorFrom: cyan
+colorFrom: blue
 colorTo: indigo
 sdk: gradio
 sdk_version: "4.44.0"

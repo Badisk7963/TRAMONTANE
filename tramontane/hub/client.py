@@ -62,10 +62,9 @@ class HubClient:
             search_tags = [_TAG, *(tags or [])]
             datasets = api.list_datasets(
                 search=query,
-                tags=search_tags,
+                filter=search_tags,
                 limit=limit,
                 sort="likes",
-                direction=-1,
             )
             results: list[HubPipeline] = []
             for ds in datasets:

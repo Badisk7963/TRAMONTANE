@@ -230,12 +230,12 @@ class PIIDetector:
     async def _detect_online(self, text: str) -> list[PIIDetection]:
         """Detect PII using Ministral-3B for contextual analysis."""
         try:
-            from mistralai import Mistral
+            from mistralai.client import Mistral
 
             client = Mistral(api_key=self._api_key)
             response = await client.chat.complete_async(
                 model="ministral-3b-latest",
-                messages=[
+                messages=[  # type: ignore[arg-type]
                     {"role": "system", "content": _CLASSIFIER_PROMPT},
                     {"role": "user", "content": text},
                 ],

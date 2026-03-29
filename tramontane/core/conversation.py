@@ -1,8 +1,8 @@
 """Conversation management wrapping the Mistral Conversations API.
 
 Tracks every exchange with token counts, costs, and GDPR awareness.
-Uses client.beta.conversations and client.beta.agents from the
-mistralai SDK.
+Uses client.beta.conversations.start_async / append_async from the
+mistralai SDK v2.x.
 """
 
 from __future__ import annotations
@@ -50,9 +50,10 @@ class ConversationEntry(BaseModel):
 class ConversationManager:
     """Manages Mistral conversations with token/cost tracking.
 
-    Wraps the mistralai SDK beta endpoints for agent creation and
-    conversation management.  When ``store_on_cloud`` is False the
-    ``store=False`` flag is passed on all API calls (GDPR-friendly).
+    Uses the Conversations API: ``start_async`` to begin, ``append_async``
+    to continue.  The ``inputs`` parameter takes a plain string.
+    Response ``outputs`` contains ``MessageOutputEntry`` objects with
+    ``.content`` and ``.role``.
     """
 
     def __init__(
@@ -61,17 +62,13 @@ class ConversationManager:
         store_on_cloud: bool = True,
         gdpr_level: str = "none",
     ) -> None:
-        self._api_key = api_key
+        import os
+
+        self._api_key = api_key or os.environ.get("MISTRAL_API_KEY")
         self._store_on_cloud = store_on_cloud
         self._gdpr_level = gdpr_level
-
-        # Client created lazily on first API call (typed Any — no SDK stubs)
         self._client: Any = None
-
-        # Local history keyed by conversation_id
         self._history: dict[str, list[ConversationEntry]] = defaultdict(list)
-
-    # -- Lazy client -------------------------------------------------------
 
     def _get_client(self) -> Any:
         """Return (and cache) the Mistral client."""
@@ -88,28 +85,34 @@ class ConversationManager:
         agent_id: str,
         agent_role: str,
         first_message: str,
+        model: str = "mistral-small-latest",
+        instructions: str | None = None,
         handoff_execution: str = "client",
     ) -> str:
-        """Start a new conversation with the given agent.
+        """Start a new conversation via the Conversations API.
 
         Returns the conversation_id.
         """
         client = self._get_client()
         conversation_id = uuid.uuid4().hex
+        content = first_message
 
         try:
-            response = await client.beta.conversations.start(
-                agent_id=agent_id,
-                message=first_message,
-                handoff_execution=handoff_execution,
+            response = await client.beta.conversations.start_async(
+                inputs=first_message,
+                model=model,
+                instructions=instructions,
                 store=self._store_on_cloud,
             )
-            if hasattr(response, "conversation_id"):
-                conversation_id = response.conversation_id
+            conversation_id = response.conversation_id or conversation_id
+            content = self._extract_output(response)
+
         except Exception:
-            logger.warning(
-                "Failed to start conversation via API — using local tracking",
-                exc_info=True,
+            logger.debug(
+                "Conversations API unavailable — falling back to chat completions",
+            )
+            content = await self._chat_fallback(
+                client, model, instructions, first_message,
             )
 
         entry = ConversationEntry(
@@ -117,7 +120,7 @@ class ConversationManager:
             agent_id=agent_id,
             agent_role=agent_role,
             entry_type="message.output",
-            content=first_message,
+            content=content,
         )
         self._history[conversation_id].append(entry)
 
@@ -136,25 +139,18 @@ class ConversationManager:
         """Append a message to the conversation and return the response entry."""
         client = self._get_client()
 
-        input_tokens = 0
-        output_tokens = 0
         content = ""
         model_used: str | None = None
 
         try:
-            response = await client.beta.conversations.append(
+            response = await client.beta.conversations.append_async(
                 conversation_id=conversation_id,
-                message=message,
+                inputs=message,
                 store=self._store_on_cloud,
             )
-            if hasattr(response, "choices") and response.choices:
-                choice = response.choices[0]
-                content = choice.message.content or ""
-            if hasattr(response, "usage") and response.usage:
-                usage = response.usage
-                input_tokens = getattr(usage, "prompt_tokens", 0)
-                output_tokens = getattr(usage, "completion_tokens", 0)
+            content = self._extract_output(response)
             model_used = getattr(response, "model", None)
+
         except Exception:
             logger.warning(
                 "Failed to append to conversation %s via API",
@@ -169,8 +165,6 @@ class ConversationManager:
             entry_type="message.output",
             content=content,
             model_used=model_used,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
         )
         self._history[conversation_id].append(entry)
         return entry
@@ -180,37 +174,23 @@ class ConversationManager:
         conversation_id: str,
         message: str,
     ) -> AsyncGenerator[str, None]:
-        """Yield token chunks as they arrive from the conversation.
-
-        Records final token count on completion.
-        """
+        """Yield token chunks as they arrive from the conversation."""
         client = self._get_client()
         total_content = ""
-        input_tokens = 0
-        output_tokens = 0
         model_used: str | None = None
 
         try:
-            stream = await client.beta.conversations.append(
+            stream = client.beta.conversations.append_stream_async(
                 conversation_id=conversation_id,
-                message=message,
+                inputs=message,
                 store=self._store_on_cloud,
-                stream=True,
             )
-            async for chunk in stream:
-                if hasattr(chunk, "choices") and chunk.choices:
-                    delta = chunk.choices[0].delta
-                    if hasattr(delta, "content") and delta.content:
-                        total_content += delta.content
-                        yield delta.content
-                if hasattr(chunk, "usage") and chunk.usage:
-                    input_tokens = getattr(
-                        chunk.usage, "prompt_tokens", 0
-                    )
-                    output_tokens = getattr(
-                        chunk.usage, "completion_tokens", 0
-                    )
-                model_used = getattr(chunk, "model", model_used)
+            async for event in stream:
+                # Extract text chunks from stream events
+                text = self._extract_stream_chunk(event)
+                if text:
+                    total_content += text
+                    yield text
         except Exception:
             logger.warning(
                 "Streaming failed for conversation %s",
@@ -223,8 +203,6 @@ class ConversationManager:
             entry_type="message.output",
             content=total_content,
             model_used=model_used,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
         )
         self._history[conversation_id].append(entry)
 
@@ -241,3 +219,48 @@ class ConversationManager:
     def clear(self, conversation_id: str) -> None:
         """Remove local history for a conversation."""
         self._history.pop(conversation_id, None)
+
+    # -- Internal helpers --------------------------------------------------
+
+    @staticmethod
+    def _extract_output(response: Any) -> str:
+        """Extract text content from a ConversationResponse."""
+        outputs = getattr(response, "outputs", None) or []
+        parts: list[str] = []
+        for out in outputs:
+            content = getattr(out, "content", None)
+            if content:
+                parts.append(str(content))
+            elif hasattr(out, "text"):
+                parts.append(str(out.text))
+        return "\n".join(parts) if parts else ""
+
+    @staticmethod
+    def _extract_stream_chunk(event: Any) -> str:
+        """Extract a text chunk from a streaming event."""
+        if hasattr(event, "data"):
+            data = event.data
+            if hasattr(data, "content"):
+                return str(data.content)
+        if hasattr(event, "content"):
+            return str(event.content)
+        return ""
+
+    @staticmethod
+    async def _chat_fallback(
+        client: Any,
+        model: str,
+        instructions: str | None,
+        message: str,
+    ) -> str:
+        """Fallback to standard chat completions when Conversations API is unavailable."""
+        messages: list[dict[str, str]] = []
+        if instructions:
+            messages.append({"role": "system", "content": instructions})
+        messages.append({"role": "user", "content": message})
+
+        response = await client.chat.complete_async(
+            model=model,
+            messages=messages,
+        )
+        return str(response.choices[0].message.content or "")

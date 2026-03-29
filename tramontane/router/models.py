@@ -60,7 +60,7 @@ MISTRAL_MODELS: dict[str, MistralModel] = {
         license="MRL",
     ),
     "devstral-small": MistralModel(
-        api_id="devstral-small-2505",
+        api_id="devstral-small-latest",
         tier=2,
         cost_per_1m_input_eur=0.10,
         cost_per_1m_output_eur=0.30,

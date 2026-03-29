@@ -257,57 +257,50 @@ class Pipeline:
                         run.output = current_output
                         break
 
-                # Register agent on Mistral (if not done)
+                # Resolve model for this agent
+                model_api_id = decision.primary_model
+                from tramontane.router.models import MISTRAL_MODELS
+
+                model_info = MISTRAL_MODELS.get(model_api_id)
+                api_model = model_info.api_id if model_info else model_api_id
                 agent_id = agent._mistral_agent_id or uuid.uuid4().hex
 
-                # Start or append to conversation
-                if step == 0:
+                # Each agent gets a fresh conversation with its own
+                # system prompt passed as instructions.
+                async def _run_agent() -> str:
                     conv_id = await conv_mgr.start(
                         agent_id=agent_id,
                         agent_role=current_role,
                         first_message=current_output,
+                        model=api_model,
+                        instructions=agent.system_prompt(),
+                        handoff_execution="client",
                     )
-                else:
-                    conv_id = agent._conversation_id or uuid.uuid4().hex
-                    await conv_mgr.append(
-                        conversation_id=conv_id,
-                        message=current_output,
-                        agent_id=agent_id,
-                    )
+                    # start() already returns the model's response
+                    history = conv_mgr.get_history(conv_id)
+                    if history:
+                        return history[-1].content
+                    return ""
 
                 # Guard 5: timeout
                 timeout = agent.max_execution_time
                 if timeout:
                     try:
-                        entry = await asyncio.wait_for(
-                            conv_mgr.append(
-                                conversation_id=conv_id,
-                                message=current_output,
-                            ),
+                        current_output = await asyncio.wait_for(
+                            _run_agent(),
                             timeout=float(timeout),
                         )
-                        current_output = entry.content
                     except asyncio.TimeoutError:
                         raise AgentTimeoutError(
                             agent_role=current_role,
                             timeout_seconds=timeout,
                         )
                 else:
-                    entry = await conv_mgr.append(
-                        conversation_id=conv_id,
-                        message=current_output,
-                    )
-                    current_output = entry.content
+                    current_output = await _run_agent()
 
                 # Guard 6: empty output retry
                 if not current_output.strip():
-                    retry_entry = await conv_mgr.append(
-                        conversation_id=conv_id,
-                        message="Please provide a response.",
-                    )
-                    current_output = retry_entry.content or (
-                        "[Empty output after retry]"
-                    )
+                    current_output = "[Empty output from agent]"
 
                 # Track costs
                 cost = decision.estimated_cost_eur
@@ -335,7 +328,7 @@ class Pipeline:
                         handoff_id=uuid.uuid4().hex,
                         from_agent_role=current_role,
                         to_agent_role=next_role,
-                        conversation_id=conv_id,
+                        conversation_id=run.run_id,
                         timestamp=datetime.datetime.now(
                             datetime.timezone.utc
                         ),

@@ -426,14 +426,13 @@ with gr.Blocks(
 
                 gr.ChatInterface(
                     fn=run_live_agent,
+                    type="messages",
                     additional_inputs=[agent_type, live_budget],
                     chatbot=gr.Chatbot(
                         height=480,
+                        type="messages",
                         placeholder="Type a message to talk to the agent...",
                     ),
-                    retry_btn=None,
-                    undo_btn=None,
-                    clear_btn="Clear",
                 )
             else:
                 gr.Markdown(

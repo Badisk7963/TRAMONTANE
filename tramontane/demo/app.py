@@ -59,30 +59,39 @@ AGENT_PRESETS: dict[str, dict[str, str]] = {
     },
 }
 
-DEFAULT_BENCHMARK_CODE = '''\
-import sqlite3
+DEFAULT_BENCHMARK_CODE = (
+    "import sqlite3\n\n"
+    "def get_user(user_id):\n"
+    '    conn = sqlite3.connect("users.db")\n'
+    '    query = f"SELECT * FROM users WHERE id = {user_id}"\n'
+    "    result = conn.execute(query).fetchone()\n"
+    "    conn.close()\n"
+    "    return result\n\n"
+    "def save_file(filename, content):\n"
+    '    path = "/tmp/" + filename\n'
+    '    with open(path, "w") as f:\n'
+    "        f.write(content)\n"
+    "    return path\n\n"
+    'API_KEY = "sk-1234567890abcdef"\n'
+)
 
-def get_user(user_id):
-    conn = sqlite3.connect("users.db")
-    query = f"SELECT * FROM users WHERE id = {user_id}"
-    result = conn.execute(query).fetchone()
-    conn.close()
-    return result
+BENCHMARK_EXAMPLE_2 = (
+    "import os, pickle\n\n"
+    "def load_config(user_input):\n"
+    "    data = pickle.loads(user_input)\n"
+    "    return data\n\n"
+    "def run_cmd(cmd):\n"
+    "    os.system(cmd)\n"
+)
 
-def save_file(filename, content):
-    path = "/tmp/" + filename
-    with open(path, "w") as f:
-        f.write(content)
-    return path
-
-API_KEY = "sk-1234567890abcdef"
-'''
-
-BENCHMARK_EXAMPLES: list[list[str]] = [
-    [DEFAULT_BENCHMARK_CODE],
-    ['def add(a, b): return a + b  # review this function'],
-    ['for i in range(len(lst)):\n    print(lst[i])'],
-]
+BENCHMARK_EXAMPLE_3 = (
+    "from flask import Flask, request\n"
+    "app = Flask(__name__)\n\n"
+    "@app.route('/search')\n"
+    "def search():\n"
+    "    q = request.args.get('q')\n"
+    '    return f"<h1>Results for {q}</h1>"\n'
+)
 
 EXAMPLES: list[list[Any]] = [
     ["Write a Python function to parse JSON and handle errors", 0.05, "en"],
@@ -579,54 +588,68 @@ with gr.Blocks(
 
         # ── TAB 3: Benchmark ──
         with gr.TabItem("Benchmark"):
-            if HAS_API_KEY:
-                gr.Markdown(
-                    "**Tramontane vs Raw SDK \u2014 same prompt, same API.**\n"
-                    "Tramontane auto-routes to the best model. "
-                    "Raw SDK always uses mistral-small.\n\n"
-                    "*Each run = 2 API calls against your daily limit*"
+            gr.Markdown(
+                "**Tramontane vs Raw SDK \u2014 same prompt, same API.**\n"
+                "Tramontane auto-routes to the best model for the task. "
+                "Raw SDK always uses mistral-small.\n\n"
+                "*Each run = 2 API calls against your daily limit*"
+            )
+
+            bench_code = gr.Textbox(
+                value=DEFAULT_BENCHMARK_CODE,
+                label="CODE TO REVIEW",
+                lines=12,
+                max_lines=20,
+                placeholder="Paste Python code here...",
+            )
+
+            with gr.Row():
+                gr.Button(
+                    "SQL injection + path traversal",
+                    variant="secondary",
+                    size="sm",
+                ).click(
+                    fn=lambda: DEFAULT_BENCHMARK_CODE,
+                    outputs=[bench_code],
+                )
+                gr.Button(
+                    "Pickle + os.system",
+                    variant="secondary",
+                    size="sm",
+                ).click(
+                    fn=lambda: BENCHMARK_EXAMPLE_2,
+                    outputs=[bench_code],
+                )
+                gr.Button(
+                    "XSS in Flask",
+                    variant="secondary",
+                    size="sm",
+                ).click(
+                    fn=lambda: BENCHMARK_EXAMPLE_3,
+                    outputs=[bench_code],
                 )
 
-                bench_code = gr.Code(
-                    value=DEFAULT_BENCHMARK_CODE,
-                    language="python",
-                    label="CODE TO REVIEW",
-                    lines=12,
+            bench_btn = gr.Button(
+                "Run Benchmark", variant="primary", size="lg",
+            )
+
+            with gr.Row():
+                tram_output = gr.Markdown(
+                    value="*Tramontane result will appear here*",
+                    label="Tramontane (auto-routed)",
                 )
-                bench_btn = gr.Button(
-                    "Run Benchmark", variant="primary", size="lg",
+                raw_output = gr.Markdown(
+                    value="*Raw SDK result will appear here*",
+                    label="Raw SDK (mistral-small)",
                 )
 
-                with gr.Row():
-                    tram_output = gr.Markdown(
-                        label="Tramontane (auto-routed)",
-                    )
-                    raw_output = gr.Markdown(
-                        label="Raw SDK (mistral-small)",
-                    )
+            bench_summary = gr.Markdown()
 
-                bench_summary = gr.Markdown()
-
-                gr.Markdown("### Example Code Snippets")
-                gr.Examples(
-                    examples=BENCHMARK_EXAMPLES,
-                    inputs=[bench_code],
-                    label=None,
-                )
-
-                bench_btn.click(
-                    fn=run_benchmark,
-                    inputs=[bench_code],
-                    outputs=[tram_output, raw_output, bench_summary],
-                )
-            else:
-                gr.Markdown(
-                    "### Benchmark Unavailable\n\n"
-                    "No API key configured. Install locally:\n\n"
-                    "```bash\npip install tramontane\n"
-                    "python benchmarks/run_benchmarks.py "
-                    "--only tramontane,direct\n```"
-                )
+            bench_btn.click(
+                fn=run_benchmark,
+                inputs=[bench_code],
+                outputs=[tram_output, raw_output, bench_summary],
+            )
 
     with gr.Accordion("Mistral Model Fleet", open=False):
         fleet_table = gr.Dataframe(

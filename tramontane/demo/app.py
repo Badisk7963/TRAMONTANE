@@ -59,6 +59,31 @@ AGENT_PRESETS: dict[str, dict[str, str]] = {
     },
 }
 
+DEFAULT_BENCHMARK_CODE = '''\
+import sqlite3
+
+def get_user(user_id):
+    conn = sqlite3.connect("users.db")
+    query = f"SELECT * FROM users WHERE id = {user_id}"
+    result = conn.execute(query).fetchone()
+    conn.close()
+    return result
+
+def save_file(filename, content):
+    path = "/tmp/" + filename
+    with open(path, "w") as f:
+        f.write(content)
+    return path
+
+API_KEY = "sk-1234567890abcdef"
+'''
+
+BENCHMARK_EXAMPLES: list[list[str]] = [
+    [DEFAULT_BENCHMARK_CODE],
+    ['def add(a, b): return a + b  # review this function'],
+    ['for i in range(len(lst)):\n    print(lst[i])'],
+]
+
 EXAMPLES: list[list[Any]] = [
     ["Write a Python function to parse JSON and handle errors", 0.05, "en"],
     ["Analyze the impact of the EU AI Act on French SMEs", 0.10, "fr"],
@@ -245,6 +270,110 @@ async def run_live_agent(
     except Exception as exc:
         logger.error("Live agent error: %s", exc, exc_info=True)
         yield f"Error: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Tab 3: Benchmark (Tramontane vs raw SDK)
+# ---------------------------------------------------------------------------
+
+
+async def run_benchmark(
+    code: str, request: gr.Request,
+) -> tuple[str, str, str]:
+    """Run same code review via Tramontane (routed) and raw SDK (mistral-small)."""
+    if not HAS_API_KEY:
+        msg = "Benchmark unavailable \u2014 no API key configured."
+        return msg, msg, ""
+
+    if not code.strip():
+        return "Enter code above.", "Enter code above.", ""
+
+    # Rate limit: benchmark costs 2 calls
+    for _ in range(2):
+        allowed, limit_msg = check_rate_limit(request)
+        if not allowed:
+            return limit_msg, limit_msg, ""
+
+    prompt = f"Review this code for bugs and security issues:\n\n```python\n{code.strip()}\n```"
+    max_chars = 2000
+
+    # --- Tramontane side ---
+    tram_md = ""
+    try:
+        agent = Agent(
+            role="Code Reviewer",
+            goal="Find bugs and security issues",
+            backstory="Senior Python security engineer",
+            model="auto",
+            budget_eur=0.01,
+        )
+        tram_result = await agent.run(prompt, router=online_router)
+        record_spend(tram_result.cost_eur)
+
+        tram_md = (
+            f"**Model:** `{tram_result.model_used}` "
+            f"(auto-routed)\n\n"
+            f"**Cost:** \u20ac{tram_result.cost_eur:.4f} \u00b7 "
+            f"**Tokens:** {tram_result.input_tokens} in / "
+            f"{tram_result.output_tokens} out \u00b7 "
+            f"**{tram_result.duration_seconds:.1f}s**\n\n---\n\n"
+            f"{tram_result.output[:max_chars]}"
+        )
+    except Exception as exc:
+        tram_md = f"Error: {exc}"
+
+    # --- Raw SDK side ---
+    raw_md = ""
+    try:
+        from mistralai.client import Mistral
+
+        client = Mistral(api_key=os.environ.get("MISTRAL_API_KEY"))
+        import time as _time
+
+        t0 = _time.monotonic()
+        resp = await client.chat.complete_async(
+            model="mistral-small-latest",
+            messages=[  # type: ignore[arg-type]
+                {
+                    "role": "system",
+                    "content": "You are a code reviewer. Find bugs and security issues.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+        dur = _time.monotonic() - t0
+        raw_output = str(resp.choices[0].message.content or "")
+        in_tok = (resp.usage.prompt_tokens or 0) if resp.usage else 0
+        out_tok = (resp.usage.completion_tokens or 0) if resp.usage else 0
+        raw_cost = (in_tok / 1e6) * 0.10 + (out_tok / 1e6) * 0.30
+        record_spend(raw_cost)
+
+        raw_md = (
+            f"**Model:** `mistral-small` (hardcoded)\n\n"
+            f"**Cost:** \u20ac{raw_cost:.4f} \u00b7 "
+            f"**Tokens:** {in_tok} in / {out_tok} out \u00b7 "
+            f"**{dur:.1f}s**\n\n---\n\n"
+            f"{raw_output[:max_chars]}"
+        )
+    except Exception as exc:
+        raw_md = f"Error: {exc}"
+
+    # --- Summary ---
+    summary = (
+        "**Tramontane** auto-selects a specialized model for the task "
+        "(e.g. devstral for code), while the raw SDK always uses "
+        "mistral-small. Both see the same prompt."
+    )
+
+    ip = request.client.host if request and request.client else "unknown"
+    calls_used = len(_ip_calls.get(ip, []))
+    remaining = MAX_CALLS_PER_IP_PER_DAY - calls_used
+    summary += (
+        f"\n\n*Calls remaining today: {remaining}/"
+        f"{MAX_CALLS_PER_IP_PER_DAY}*"
+    )
+
+    return tram_md, raw_md, summary
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +575,57 @@ with gr.Blocks(
                     "python examples/quickstart.py\n```\n\n"
                     "**Try the Router Explorer tab** to see how "
                     "intelligent model routing works!"
+                )
+
+        # ── TAB 3: Benchmark ──
+        with gr.TabItem("Benchmark"):
+            if HAS_API_KEY:
+                gr.Markdown(
+                    "**Tramontane vs Raw SDK \u2014 same prompt, same API.**\n"
+                    "Tramontane auto-routes to the best model. "
+                    "Raw SDK always uses mistral-small.\n\n"
+                    "*Each run = 2 API calls against your daily limit*"
+                )
+
+                bench_code = gr.Code(
+                    value=DEFAULT_BENCHMARK_CODE,
+                    language="python",
+                    label="CODE TO REVIEW",
+                    lines=12,
+                )
+                bench_btn = gr.Button(
+                    "Run Benchmark", variant="primary", size="lg",
+                )
+
+                with gr.Row():
+                    tram_output = gr.Markdown(
+                        label="Tramontane (auto-routed)",
+                    )
+                    raw_output = gr.Markdown(
+                        label="Raw SDK (mistral-small)",
+                    )
+
+                bench_summary = gr.Markdown()
+
+                gr.Markdown("### Example Code Snippets")
+                gr.Examples(
+                    examples=BENCHMARK_EXAMPLES,
+                    inputs=[bench_code],
+                    label=None,
+                )
+
+                bench_btn.click(
+                    fn=run_benchmark,
+                    inputs=[bench_code],
+                    outputs=[tram_output, raw_output, bench_summary],
+                )
+            else:
+                gr.Markdown(
+                    "### Benchmark Unavailable\n\n"
+                    "No API key configured. Install locally:\n\n"
+                    "```bash\npip install tramontane\n"
+                    "python benchmarks/run_benchmarks.py "
+                    "--only tramontane,direct\n```"
                 )
 
     with gr.Accordion("Mistral Model Fleet", open=False):

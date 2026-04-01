@@ -315,3 +315,13 @@ class TestRunStream:
         finally:
             if original:
                 os.environ["MISTRAL_API_KEY"] = original
+
+
+class TestPublicExports:
+    """Package-level exports."""
+
+    def test_stream_event_importable_from_package(self) -> None:
+        from tramontane import StreamEvent
+
+        e = StreamEvent(type="start", model_used="mistral-small")
+        assert e.type == "start"

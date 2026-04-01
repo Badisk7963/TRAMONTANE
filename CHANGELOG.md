@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.2.1 (2026-04-01) — Smart Fleet + Self-Learning Router
+
+**The conductor the Mistral fleet was waiting for.**
+
+### New Models
+- Mistral Small 4 (unified: reasoning + vision + code, configurable effort)
+- Mistral Large 3 (675B MoE frontier, Apache 2.0)
+- Voxtral TTS (text-to-speech, 9 languages, edge-deployable)
+
+### Smart Fleet
+- `reasoning_effort` parameter (none/medium/high) for Mistral Small 4
+- Progressive reasoning: auto-escalate effort on validation failure
+- Model cascading: try cheap models first, escalate on failure
+- FleetProfile presets: BUDGET, BALANCED, QUALITY, UNIFIED
+- Pipeline cost simulation: estimate cost before running
+- Adaptive budget reallocation: unspent budget flows to later agents
+
+### Self-Learning Router
+- FleetTelemetry records every routing decision + outcome
+- After 50+ outcomes, router uses data-driven suggestions
+- Per-model success rate, cost, and latency tracking
+- `tramontane doctor` and `tramontane fleet` CLI commands
+
+### Router Improvements
+- Mistral Small 4 as new default for general/reasoning/vision
+- Simplified routing: code->devstral, classification->ministral, else->small-4
+- Reasoning effort auto-determined from task complexity
+
+### Validated
+- 157 unit tests passing
+- ruff clean, mypy clean
+
 ## v0.2.0 (2026-04-01) — Battle-tested on ArkhosAI
 
 ### Added

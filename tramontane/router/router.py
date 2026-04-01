@@ -58,6 +58,7 @@ class RoutingDecision(BaseModel):
     estimated_cost_eur: float
     downgrade_applied: bool
     downgrade_reason: str | None = None
+    reasoning_effort: str | None = None
 
 
 class MistralRouter:
@@ -72,6 +73,7 @@ class MistralRouter:
         rules_path: str | None = None,
         local_mode: bool = False,
         classifier: TaskClassifier | None = None,
+        telemetry: Any | None = None,
     ) -> None:
         path = Path(rules_path) if rules_path else _DEFAULT_RULES_PATH
         self._rules: dict[str, Any] = yaml.safe_load(
@@ -79,6 +81,7 @@ class MistralRouter:
         )
         self._local_mode = local_mode
         self._classifier = classifier or TaskClassifier()
+        self._telemetry = telemetry
 
     # -----------------------------------------------------------------
     # Main routing
@@ -116,8 +119,24 @@ class MistralRouter:
                 downgrade_applied=False,
             )
 
-        # -- Decision tree (from CLAUDE.md) --------------------------------
-        primary = self._decide_primary(classification)
+        # -- Telemetry-driven routing (overrides rules when data is strong) --
+        if self._telemetry and self._telemetry.total_outcomes >= 50:
+            suggestion = self._telemetry.suggest_model(
+                task_type=classification.task_type,
+                complexity=classification.complexity,
+            )
+            if suggestion:
+                primary = suggestion
+                logger.info(
+                    "Telemetry override: %s for %s/complexity=%d",
+                    suggestion, classification.task_type,
+                    classification.complexity,
+                )
+            else:
+                primary = self._decide_primary(classification)
+        else:
+            # -- Decision tree (from CLAUDE.md) --------------------------------
+            primary = self._decide_primary(classification)
 
         # -- Budget constraint ---------------------------------------------
         if agent_budget_eur is not None:
@@ -175,6 +194,9 @@ class MistralRouter:
             estimated_cost_eur=estimated_cost,
             downgrade_applied=downgrade_applied,
             downgrade_reason=downgrade_reason,
+            reasoning_effort=self._decide_reasoning_effort(
+                classification, primary,
+            ),
         )
 
     def route_sync(
@@ -348,6 +370,21 @@ class MistralRouter:
             if fb and fb.local_ollama:
                 return fallback
         return alias
+
+    @staticmethod
+    def _decide_reasoning_effort(
+        cls_result: ClassificationResult,
+        model_alias: str,
+    ) -> str | None:
+        """Determine reasoning effort for models that support it."""
+        model_info = MISTRAL_MODELS.get(model_alias)
+        if not model_info or not model_info.supports_reasoning_effort:
+            return None
+        if cls_result.complexity <= 2:
+            return "none"
+        if cls_result.complexity == 3:
+            return "medium"
+        return "high"
 
     @staticmethod
     def _estimate_cost(model_info: MistralModel, est_output_tokens: int) -> float:

@@ -25,6 +25,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from tramontane.core.exceptions import AgentTimeoutError, BudgetExceededError
+from tramontane.core.profiles import FleetProfile, apply_profile
 from tramontane.router.models import MISTRAL_MODELS, MistralModel, get_model
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,11 @@ class RunContext:
     spent_eur: float = 0.0
     run_id: str = dataclasses.field(default_factory=lambda: uuid.uuid4().hex[:12])
     agent_costs: dict[str, float] = dataclasses.field(default_factory=dict)
+    reallocation: Literal["fixed", "adaptive"] = "fixed"
+    """'fixed': each agent uses its own budget_eur.
+    'adaptive': unspent budget from earlier agents flows to later agents."""
+    _agent_budgets: dict[str, float] = dataclasses.field(default_factory=dict)
+    """Original budgets per agent role for tracking savings."""
 
     @property
     def remaining_eur(self) -> float | None:
@@ -55,6 +61,31 @@ class RunContext:
         """Record cost from an agent execution."""
         self.spent_eur += cost_eur
         self.agent_costs[agent_role] = self.agent_costs.get(agent_role, 0.0) + cost_eur
+
+    def get_effective_budget(self, agent_role: str, agent_budget: float | None) -> float | None:
+        """Get effective budget for an agent, including reallocated savings."""
+        if self.reallocation == "fixed" or agent_budget is None:
+            return agent_budget
+
+        self._agent_budgets[agent_role] = agent_budget
+        total_savings = 0.0
+        for role, original_budget in self._agent_budgets.items():
+            if role == agent_role:
+                continue
+            actual_cost = self.agent_costs.get(role, 0.0)
+            if actual_cost < original_budget:
+                total_savings += (original_budget - actual_cost)
+
+        effective = agent_budget + total_savings
+        if total_savings > 0:
+            logger.info(
+                "Adaptive reallocation: %s gets €%.4f (€%.4f base + €%.4f savings)",
+                agent_role,
+                effective,
+                agent_budget,
+                total_savings,
+            )
+        return effective
 
 
 class AgentResult(BaseModel):
@@ -80,6 +111,7 @@ class StreamEvent(BaseModel):
     type: Literal[
         "start", "token", "complete", "error",
         "pattern_match", "validation_retry",
+        "reasoning_escalation", "cascade_escalation",
     ]
     token: str = ""
     model_used: str = ""
@@ -133,6 +165,13 @@ class Agent(BaseModel):
     allow_delegation: bool = False
     temperature: float | None = None
     """Sampling temperature (0.0-1.5). None = model default."""
+    reasoning_effort: Literal["none", "medium", "high"] | None = None
+    """Reasoning effort for models that support it (e.g. mistral-small-4).
+    None = model default. Only passed if the resolved model supports it."""
+    reasoning_strategy: Literal["fixed", "progressive"] = "fixed"
+    """'fixed' uses the set reasoning_effort. 'progressive' starts at
+    'none' and escalates through 'medium' then 'high' if validate_output
+    fails. Only works with models that support reasoning_effort."""
 
     # ── MEMORY (from Agno) ───────────────────────────────────────────
     memory: bool = True
@@ -146,12 +185,20 @@ class Agent(BaseModel):
     gdpr_level: Literal["none", "standard", "strict"] = "none"
     store_on_cloud: bool = True
 
-    # ── OUTPUT VALIDATION ──────────────────────────────────────────
+    # ── OUTPUT VALIDATION + CASCADE ─────────────────────────────────
     validate_output: Callable[[AgentResult], bool] | None = None
     """Optional output validator. Returns True if acceptable.
     If False, agent retries up to max_validation_retries times."""
     max_validation_retries: int = 2
     """Max retries when validate_output returns False."""
+    cascade: list[str | dict[str, Any]] | None = None
+    """Model cascade chain. If validate_output fails on the primary model,
+    try each subsequent model. Entries are alias strings or dicts with
+    model + overrides (e.g. {"model": "devstral-2", "max_tokens": 32000}).
+    Cascade combines with progressive reasoning — effort levels are tried
+    per model before cascading to the next."""
+    fleet_profile: FleetProfile | None = None
+    """Optional fleet profile preset. Applies when model='auto'."""
 
     # ── OBSERVABILITY ────────────────────────────────────────────────
     audit_actions: bool = True
@@ -204,6 +251,24 @@ class Agent(BaseModel):
                     spent_eur=spent_eur,
                     pipeline_name=self.role,
                 )
+
+    def _check_budget_with_override(
+        self,
+        estimated_cost: float,
+        spent_eur: float,
+        budget_override: float | None,
+    ) -> None:
+        """Check budget using an explicit override when provided."""
+        if budget_override is None:
+            self.check_budget(estimated_cost, spent_eur=spent_eur)
+            return
+        budget_remaining = budget_override - spent_eur
+        if estimated_cost > budget_remaining * 2.0:
+            raise BudgetExceededError(
+                budget_eur=budget_override,
+                spent_eur=spent_eur,
+                pipeline_name=self.role,
+            )
 
     # ── PROMPT BUILDING ──────────────────────────────────────────────
 
@@ -286,31 +351,107 @@ class Agent(BaseModel):
             BudgetExceededError: If estimated cost exceeds remaining budget.
             AgentTimeoutError: If max_execution_time is exceeded.
         """
-        result: AgentResult | None = None
-        for validation_attempt in range(
-            (self.max_validation_retries + 1) if self.validate_output else 1,
-        ):
-            result = await self._run_once(
-                input_text,
-                router=router,
-                conversation_history=conversation_history,
-                run_id=run_id,
-                spent_eur=run_context.spent_eur if run_context else spent_eur,
-                context=context,
+        _spent = run_context.spent_eur if run_context else spent_eur
+        profile_task_type = self.routing_hint if self.routing_hint else None
+        profile_model_override: str | None = None
+        profile_effort_override: str | None = None
+        if self.fleet_profile and self.model == "auto":
+            profile_model, profile_effort = apply_profile(
+                self.fleet_profile,
+                self.model,
+                profile_task_type,
             )
-            if self.validate_output is None or self.validate_output(result):
-                break
-            if validation_attempt < self.max_validation_retries:
-                logger.warning(
-                    "Output validation failed for %s (attempt %d/%d), retrying",
-                    self.role, validation_attempt + 1, self.max_validation_retries,
+            if profile_model != "auto":
+                profile_model_override = profile_model
+            if profile_effort is not None and self.reasoning_effort is None:
+                profile_effort_override = profile_effort
+
+        effective_budget = (
+            run_context.get_effective_budget(self.role, self.budget_eur)
+            if run_context and run_context.reallocation == "adaptive"
+            else self.budget_eur
+        )
+
+        async def _try_model(
+            model_alias: str | None = None,
+            max_tok: int | None = None,
+        ) -> tuple[AgentResult | None, bool]:
+            """Try a single model with progressive/fixed strategy.
+
+            Returns (result, accepted).
+            """
+            effective_model = model_alias or self.model
+            supports_effort = False
+            if self.reasoning_strategy == "progressive" and effective_model != "auto":
+                info = MISTRAL_MODELS.get(effective_model)
+                supports_effort = bool(info and info.supports_reasoning_effort)
+
+            res: AgentResult | None = None
+            if supports_effort and self.reasoning_strategy == "progressive":
+                for effort in ("none", "medium", "high"):
+                    res = await self._run_once(
+                        input_text,
+                        router=router,
+                        conversation_history=conversation_history,
+                        run_id=run_id,
+                        spent_eur=_spent,
+                        context=context,
+                        effort_override=effort,
+                        model_override=model_alias,
+                        max_tokens_override=max_tok,
+                        budget_override=effective_budget,
+                        profile_effort_override=profile_effort_override,
+                    )
+                    if self.validate_output is None or self.validate_output(res):
+                        return res, True
+                    logger.warning(
+                        "Progressive effort='%s' failed for %s",
+                        effort, self.role,
+                    )
+                return res, False
+            # Fixed strategy
+            max_attempts = (
+                (self.max_validation_retries + 1) if self.validate_output else 1
+            )
+            for attempt in range(max_attempts):
+                res = await self._run_once(
+                    input_text,
+                    router=router,
+                    conversation_history=conversation_history,
+                    run_id=run_id,
+                    spent_eur=_spent,
+                    context=context,
+                    model_override=model_alias,
+                    max_tokens_override=max_tok,
+                    budget_override=effective_budget,
+                    profile_effort_override=profile_effort_override,
                 )
-            else:
-                logger.warning(
-                    "Output validation failed for %s after %d retries, "
-                    "accepting last result",
-                    self.role, self.max_validation_retries,
-                )
+                if self.validate_output is None or self.validate_output(res):
+                    return res, True
+                if attempt < self.max_validation_retries:
+                    logger.warning(
+                        "Validation failed for %s (attempt %d/%d)",
+                        self.role, attempt + 1, self.max_validation_retries,
+                    )
+            return res, False
+
+        # Try primary model
+        result, accepted = await _try_model(profile_model_override)
+
+        # Cascade: try subsequent models if validation failed
+        if not accepted and self.cascade and self.validate_output:
+            for i, entry in enumerate(self.cascade):
+                if isinstance(entry, str):
+                    c_model, c_max_tok = entry, None
+                else:
+                    c_model = str(entry["model"])
+                    c_max_tok = entry.get("max_tokens")
+                logger.info("Cascade level %d: trying %s", i, c_model)
+                result, accepted = await _try_model(c_model, c_max_tok)
+                if accepted:
+                    logger.info("Cascade succeeded at level %d: %s", i, c_model)
+                    break
+
         assert result is not None  # noqa: S101
         if run_context:
             run_context.record(self.role, result.cost_eur)
@@ -325,6 +466,11 @@ class Agent(BaseModel):
         run_id: str | None = None,
         spent_eur: float = 0.0,
         context: str | None = None,
+        effort_override: str | None = None,
+        model_override: str | None = None,
+        max_tokens_override: int | None = None,
+        budget_override: float | None = None,
+        profile_effort_override: str | None = None,
     ) -> AgentResult:
         """Execute a single Mistral API call (no validation retry loop)."""
         import anyio
@@ -334,19 +480,20 @@ class Agent(BaseModel):
         if not input_text or not input_text.strip():
             msg = f"Agent '{self.role}': input_text must be a non-empty string"
             raise ValueError(msg)
-        if self.budget_eur is not None and self.budget_eur < 0:
-            msg = f"Agent '{self.role}': budget_eur must be >= 0, got {self.budget_eur}"
+        budget_for_check = budget_override if budget_override is not None else self.budget_eur
+        if budget_for_check is not None and budget_for_check < 0:
+            msg = f"Agent '{self.role}': budget_eur must be >= 0, got {budget_for_check}"
             raise ValueError(msg)
 
         rid = run_id or uuid.uuid4().hex[:12]
 
-        # 1. Resolve model
-        model_alias = self.model
+        # 1. Resolve model (model_override from cascade takes priority)
+        model_alias = model_override or self.model
         routing_decision = None
         if model_alias == "auto" and router is not None:
             routing_decision = await router.route(
                 prompt=input_text,
-                agent_budget_eur=self.budget_eur,
+                agent_budget_eur=budget_for_check,
                 locale=self.locale,
                 context=self.routing_hint,
             )
@@ -369,7 +516,11 @@ class Agent(BaseModel):
         # 3. Pre-call budget check with improved estimation
         if model_info:
             est_cost = self._estimate_call_cost(messages, model_info)
-            self.check_budget(est_cost, spent_eur=spent_eur)
+            self._check_budget_with_override(
+                est_cost,
+                spent_eur=spent_eur,
+                budget_override=budget_for_check,
+            )
 
         # 4. Call Mistral with retry + exponential backoff
         api_key = os.environ.get("MISTRAL_API_KEY")
@@ -382,8 +533,8 @@ class Agent(BaseModel):
         max_retries = self.max_retry_limit
         response: Any = None
 
-        # Resolve effective max_tokens: explicit > model default
-        effective_max_tokens = self.max_tokens
+        # Resolve effective max_tokens: override > explicit > model default
+        effective_max_tokens = max_tokens_override or self.max_tokens
         if effective_max_tokens is None and model_info:
             effective_max_tokens = model_info.max_output_tokens
 
@@ -395,6 +546,17 @@ class Agent(BaseModel):
             chat_kwargs["max_tokens"] = effective_max_tokens
         if self.temperature is not None:
             chat_kwargs["temperature"] = self.temperature
+
+        # Reasoning effort: use override (progressive) or agent setting
+        effective_effort = effort_override or self.reasoning_effort or profile_effort_override
+        if effective_effort is not None and model_info:
+            if model_info.supports_reasoning_effort:
+                chat_kwargs["reasoning_effort"] = effective_effort
+            else:
+                logger.debug(
+                    "Model %s doesn't support reasoning_effort, ignoring",
+                    model_alias,
+                )
 
         for attempt in range(max_retries + 1):
             try:
@@ -512,23 +674,42 @@ class Agent(BaseModel):
                 error=f"Agent '{self.role}': input_text must be a non-empty string",
             )
             return
-        if self.budget_eur is not None and self.budget_eur < 0:
+        effective_budget = (
+            run_context.get_effective_budget(self.role, self.budget_eur)
+            if run_context and run_context.reallocation == "adaptive"
+            else self.budget_eur
+        )
+        if effective_budget is not None and effective_budget < 0:
             yield StreamEvent(
                 type="error",
-                error=f"Agent '{self.role}': budget_eur must be >= 0, got {self.budget_eur}",
+                error=f"Agent '{self.role}': budget_eur must be >= 0, got {effective_budget}",
             )
             return
 
         rid = run_id or uuid.uuid4().hex[:12]
         effective_spent = run_context.spent_eur if run_context else spent_eur
 
+        profile_task_type = self.routing_hint if self.routing_hint else None
+        profile_model_override: str | None = None
+        profile_effort_override: str | None = None
+        if self.fleet_profile and self.model == "auto":
+            profile_model, profile_effort = apply_profile(
+                self.fleet_profile,
+                self.model,
+                profile_task_type,
+            )
+            if profile_model != "auto":
+                profile_model_override = profile_model
+            if profile_effort is not None and self.reasoning_effort is None:
+                profile_effort_override = profile_effort
+
         # 1. Resolve model
-        model_alias = self.model
+        model_alias = profile_model_override or self.model
         if model_alias == "auto" and router is not None:
             try:
                 routing_decision = await router.route(
                     prompt=input_text,
-                    agent_budget_eur=self.budget_eur,
+                    agent_budget_eur=effective_budget,
                     locale=self.locale,
                     context=self.routing_hint,
                 )
@@ -555,7 +736,11 @@ class Agent(BaseModel):
         if model_info:
             est_cost = self._estimate_call_cost(messages, model_info)
             try:
-                self.check_budget(est_cost, spent_eur=effective_spent)
+                self._check_budget_with_override(
+                    est_cost,
+                    spent_eur=effective_spent,
+                    budget_override=effective_budget,
+                )
             except BudgetExceededError as exc:
                 yield StreamEvent(type="error", error=str(exc))
                 return
@@ -577,163 +762,225 @@ class Agent(BaseModel):
                 for pattern, callback in on_pattern.items()
             ]
 
-        # 6. Resolve effective max_tokens
-        effective_max_tokens = self.max_tokens
-        if effective_max_tokens is None and model_info:
-            effective_max_tokens = model_info.max_output_tokens
-
-        stream_kwargs: dict[str, Any] = {
-            "model": api_model,
-            "messages": messages,
-        }
-        if effective_max_tokens is not None:
-            stream_kwargs["max_tokens"] = effective_max_tokens
-        if self.temperature is not None:
-            stream_kwargs["temperature"] = self.temperature
-
-        # 7. Validation retry loop (re-streams if output fails validation)
-        max_val_attempts = (
-            (self.max_validation_retries + 1) if self.validate_output else 1
-        )
-        for val_attempt in range(max_val_attempts):
-            if val_attempt > 0:
-                yield StreamEvent(
-                    type="validation_retry", model_used=model_alias,
-                )
-
-            # Yield start event
-            yield StreamEvent(type="start", model_used=model_alias)
-
-            # 8. Stream from Mistral with retry + backoff + timeout
-            client = Mistral(api_key=api_key)
-            start_time = time.monotonic()
-            full_output = ""
-            input_tokens = 0
-            output_tokens = 0
-            tokens_yielded = False
-            last_checked: dict[str, int] = {}
-
-            for attempt in range(self.max_retry_limit + 1):
-                try:
-                    stream = await client.chat.stream_async(**stream_kwargs)
-                    async with stream as event_stream:
-                        async for event in event_stream:
-                            # Timeout guard (CLAUDE.md failure mode #5)
-                            if self.max_execution_time:
-                                elapsed = time.monotonic() - start_time
-                                if elapsed > self.max_execution_time:
-                                    yield StreamEvent(
-                                        type="error",
-                                        error=(
-                                            f"Agent '{self.role}' timed out "
-                                            f"after {self.max_execution_time}s"
-                                        ),
-                                    )
-                                    return
-
-                            chunk = event.data
-                            if chunk.choices:
-                                delta = chunk.choices[0].delta
-                                token_text = (
-                                    str(delta.content) if delta.content else ""
-                                )
-                                if token_text:
-                                    full_output += token_text
-                                    tokens_yielded = True
-                                    yield StreamEvent(
-                                        type="token",
-                                        token=token_text,
-                                        model_used=model_alias,
-                                    )
-                                    # Check patterns
-                                    for pat, cb in compiled_patterns:
-                                        pkey = pat.pattern
-                                        start_pos = last_checked.get(pkey, 0)
-                                        search_from = max(0, start_pos - 100)
-                                        for m in pat.finditer(
-                                            full_output, search_from,
-                                        ):
-                                            if m.start() >= start_pos:
-                                                result = cb(m, full_output)
-                                                if asyncio.iscoroutine(result):
-                                                    await result
-                                                yield StreamEvent(
-                                                    type="pattern_match",
-                                                    model_used=model_alias,
-                                                    pattern_id=pkey,
-                                                )
-                                        last_checked[pkey] = len(full_output)
-                            # Final chunk carries usage info
-                            if chunk.usage:
-                                input_tokens = (
-                                    chunk.usage.prompt_tokens or 0
-                                )
-                                output_tokens = (
-                                    chunk.usage.completion_tokens or 0
-                                )
-                    break  # success
-
-                except Exception as exc:
-                    if tokens_yielded or attempt >= self.max_retry_limit:
-                        yield StreamEvent(type="error", error=str(exc))
-                        return
-                    wait = min(2 ** attempt, 30)
-                    logger.warning(
-                        "[%s] Stream error (attempt %d/%d): %s — retrying in %ds",
-                        rid, attempt + 1, self.max_retry_limit + 1, exc, wait,
+        # 6. Build model cascade list: primary model first, then cascade entries
+        _CascadeEntry = tuple[str, str, int | None]  # (alias, api_id, max_tok)
+        cascade_models: list[_CascadeEntry] = [(model_alias, api_model, None)]
+        if self.cascade and self.validate_output:
+            for entry in self.cascade:
+                if isinstance(entry, str):
+                    c_info = MISTRAL_MODELS.get(entry)
+                    c_api = c_info.api_id if c_info else entry
+                    cascade_models.append((entry, c_api, None))
+                else:
+                    c_alias = str(entry["model"])
+                    c_info = MISTRAL_MODELS.get(c_alias)
+                    c_api = c_info.api_id if c_info else c_alias
+                    cascade_models.append(
+                        (c_alias, c_api, entry.get("max_tokens")),
                     )
-                    await anyio.sleep(wait)
 
-            duration = time.monotonic() - start_time
+        result: AgentResult | None = None
+        accepted = False
 
-            # 9. Calculate actual cost
-            actual_cost = 0.0
-            if model_info:
-                actual_cost = (
-                    (input_tokens / 1_000_000) * model_info.cost_per_1m_input_eur
-                    + (output_tokens / 1_000_000) * model_info.cost_per_1m_output_eur
+        for cascade_idx, (cur_alias, cur_api, cur_max_tok) in enumerate(
+            cascade_models,
+        ):
+            if cascade_idx > 0:
+                yield StreamEvent(
+                    type="cascade_escalation", model_used=cur_alias,
                 )
 
-            logger.debug(
-                "[%s] stream agent=%s model=%s tokens=%d/%d cost=EUR %.6f dur=%.2fs",
-                rid, self.role, model_alias, input_tokens, output_tokens,
-                actual_cost, duration,
-            )
+            cur_info = MISTRAL_MODELS.get(cur_alias)
 
-            result = AgentResult(
-                output=full_output,
-                model_used=model_alias,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cost_eur=actual_cost,
-                duration_seconds=round(duration, 3),
-                tool_calls=[],
-                reasoning_used=self.reasoning,
-            )
+            # Resolve effective max_tokens for this model
+            eff_max_tokens = cur_max_tok or self.max_tokens
+            if eff_max_tokens is None and cur_info:
+                eff_max_tokens = cur_info.max_output_tokens
 
-            # 10. Validation check
-            if self.validate_output is None or self.validate_output(result):
-                break
-            if val_attempt < self.max_validation_retries:
-                logger.warning(
-                    "Stream output validation failed for %s (attempt %d/%d)",
-                    self.role, val_attempt + 1, self.max_validation_retries,
+            stream_kwargs: dict[str, Any] = {
+                "model": cur_api,
+                "messages": messages,
+            }
+            if eff_max_tokens is not None:
+                stream_kwargs["max_tokens"] = eff_max_tokens
+            if self.temperature is not None:
+                stream_kwargs["temperature"] = self.temperature
+
+            # Reasoning effort support for this cascade model
+            supports_effort = bool(
+                cur_info and cur_info.supports_reasoning_effort
+            )
+            if (
+                (self.reasoning_effort is not None or profile_effort_override is not None)
+                and supports_effort
+                and self.reasoning_strategy == "fixed"
+            ):
+                stream_kwargs["reasoning_effort"] = (
+                    self.reasoning_effort or profile_effort_override
                 )
+
+            # Build iteration plan: progressive reasoning or fixed validation
+            use_progressive = (
+                self.reasoning_strategy == "progressive"
+                and supports_effort
+                and self.validate_output is not None
+            )
+            if use_progressive:
+                iterations: list[tuple[str | None, bool]] = [
+                    (e, i > 0) for i, e in enumerate(["none", "medium", "high"])
+                ]
+            elif self.validate_output:
+                iterations = [(None, False)] * (self.max_validation_retries + 1)
             else:
-                logger.warning(
-                    "Stream output validation failed for %s after %d retries",
-                    self.role, self.max_validation_retries,
-                )
+                iterations = [(None, False)]
 
-        if run_context:
+            for iter_effort, is_escalation in iterations:
+                if is_escalation:
+                    yield StreamEvent(
+                        type="reasoning_escalation", model_used=cur_alias,
+                    )
+                elif result is not None and cascade_idx == 0:
+                    yield StreamEvent(
+                        type="validation_retry", model_used=cur_alias,
+                    )
+
+                if iter_effort is not None:
+                    stream_kwargs["reasoning_effort"] = iter_effort
+
+                # -- Stream one attempt for this effort/model combo --
+                yield StreamEvent(type="start", model_used=cur_alias)
+
+                client = Mistral(api_key=api_key)
+                start_time = time.monotonic()
+                full_output = ""
+                input_tokens = 0
+                output_tokens = 0
+                tokens_yielded = False
+                last_checked: dict[str, int] = {}
+
+                for attempt in range(self.max_retry_limit + 1):
+                    try:
+                        stream = await client.chat.stream_async(
+                            **stream_kwargs,
+                        )
+                        async with stream as event_stream:
+                            async for event in event_stream:
+                                if self.max_execution_time:
+                                    elapsed = time.monotonic() - start_time
+                                    if elapsed > self.max_execution_time:
+                                        yield StreamEvent(
+                                            type="error",
+                                            error=(
+                                                f"Agent '{self.role}' timed out"
+                                                f" after"
+                                                f" {self.max_execution_time}s"
+                                            ),
+                                        )
+                                        return
+                                chunk = event.data
+                                if chunk.choices:
+                                    delta = chunk.choices[0].delta
+                                    token_text = (
+                                        str(delta.content)
+                                        if delta.content
+                                        else ""
+                                    )
+                                    if token_text:
+                                        full_output += token_text
+                                        tokens_yielded = True
+                                        yield StreamEvent(
+                                            type="token",
+                                            token=token_text,
+                                            model_used=cur_alias,
+                                        )
+                                        for pat, cb in compiled_patterns:
+                                            pkey = pat.pattern
+                                            sp = last_checked.get(pkey, 0)
+                                            sf = max(0, sp - 100)
+                                            for m in pat.finditer(
+                                                full_output, sf,
+                                            ):
+                                                if m.start() >= sp:
+                                                    cr = cb(m, full_output)
+                                                    if asyncio.iscoroutine(cr):
+                                                        await cr
+                                                    yield StreamEvent(
+                                                        type="pattern_match",
+                                                        model_used=cur_alias,
+                                                        pattern_id=pkey,
+                                                    )
+                                            last_checked[pkey] = len(
+                                                full_output,
+                                            )
+                                if chunk.usage:
+                                    input_tokens = (
+                                        chunk.usage.prompt_tokens or 0
+                                    )
+                                    output_tokens = (
+                                        chunk.usage.completion_tokens or 0
+                                    )
+                        break  # success
+                    except Exception as exc:
+                        if tokens_yielded or attempt >= self.max_retry_limit:
+                            yield StreamEvent(type="error", error=str(exc))
+                            return
+                        wait = min(2 ** attempt, 30)
+                        logger.warning(
+                            "[%s] Stream error (attempt %d/%d): %s — retry %ds",
+                            rid, attempt + 1, self.max_retry_limit + 1,
+                            exc, wait,
+                        )
+                        await anyio.sleep(wait)
+
+                duration = time.monotonic() - start_time
+                actual_cost = 0.0
+                if cur_info:
+                    actual_cost = (
+                        (input_tokens / 1e6) * cur_info.cost_per_1m_input_eur
+                        + (output_tokens / 1e6) * cur_info.cost_per_1m_output_eur
+                    )
+                logger.debug(
+                    "[%s] stream agent=%s model=%s tokens=%d/%d cost=EUR %.6f",
+                    rid, self.role, cur_alias, input_tokens, output_tokens,
+                    actual_cost,
+                )
+                result = AgentResult(
+                    output=full_output,
+                    model_used=cur_alias,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost_eur=actual_cost,
+                    duration_seconds=round(duration, 3),
+                    tool_calls=[],
+                    reasoning_used=self.reasoning,
+                )
+                if self.validate_output is None or self.validate_output(result):
+                    accepted = True
+                    break
+                logger.warning(
+                    "Stream validation failed for %s (model=%s, effort=%s)",
+                    self.role, cur_alias, iter_effort or "fixed",
+                )
+            # Break outer cascade loop if accepted
+            if accepted:
+                break
+
+        if not accepted and result is not None:
+            logger.warning(
+                "All stream attempts failed validation for %s, "
+                "accepting last result",
+                self.role,
+            )
+
+        if run_context and result is not None:
             run_context.record(self.role, result.cost_eur)
 
-        # 11. Yield complete event
-        yield StreamEvent(
-            type="complete",
-            model_used=model_alias,
-            result=result,
-        )
+        if result is not None:
+            yield StreamEvent(
+                type="complete",
+                model_used=result.model_used,
+                result=result,
+            )
 
     def _estimate_call_cost(
         self,

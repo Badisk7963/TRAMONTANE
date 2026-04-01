@@ -232,3 +232,132 @@ class TestDesignVsVision:
         """Design task should NOT route to pixtral-large (tier 4, €2/6)."""
         d = offline_router.route_sync("Create a design system with warm colors")
         assert d.primary_model != "pixtral-large"
+
+
+class TestModelFleet:
+    """Model registry completeness."""
+
+    def test_all_models_importable(self) -> None:
+        from tramontane.router.models import MISTRAL_MODELS
+
+        assert len(MISTRAL_MODELS) >= 13
+        for alias, model in MISTRAL_MODELS.items():
+            assert model.api_id, f"{alias} missing api_id"
+            assert model.tier >= 0, f"{alias} invalid tier"
+
+    def test_mistral_small_4_reasoning_effort(self) -> None:
+        from tramontane.router.models import get_model
+
+        m = get_model("mistral-small-4")
+        assert m.supports_reasoning_effort is True
+        assert m.supports_vision is True
+        assert m.context_window == 256_000
+
+    def test_voxtral_tts_exists(self) -> None:
+        from tramontane.router.models import get_model
+
+        m = get_model("voxtral-tts")
+        assert m.modality == "text-to-speech"
+        assert m.max_output_tokens == 0
+
+    def test_existing_models_default_false(self) -> None:
+        from tramontane.router.models import get_model
+
+        m = get_model("mistral-small")
+        assert m.supports_reasoning_effort is False
+        assert m.supports_vision is False
+
+
+class TestFleetTelemetry:
+    """Self-learning router telemetry."""
+
+    def test_record_and_retrieve(self, tmp_path: object) -> None:
+        from tramontane.router.telemetry import FleetTelemetry, RoutingOutcome
+
+        db = str(tmp_path) + "/test.db"  # type: ignore[operator]
+        t = FleetTelemetry(db_path=db)
+        t.record(RoutingOutcome(
+            task_type="code", complexity=3, model_used="devstral-small",
+            reasoning_effort=None, success=True, cost_eur=0.001,
+            latency_s=1.5, output_tokens=500, agent_role="builder",
+        ))
+        assert t.total_outcomes == 1
+
+    def test_suggest_returns_none_below_min_samples(self, tmp_path: object) -> None:
+        from tramontane.router.telemetry import FleetTelemetry, RoutingOutcome
+
+        db = str(tmp_path) + "/test.db"  # type: ignore[operator]
+        t = FleetTelemetry(db_path=db)
+        for _ in range(5):
+            t.record(RoutingOutcome(
+                task_type="code", complexity=3, model_used="devstral-small",
+                reasoning_effort=None, success=True, cost_eur=0.001,
+                latency_s=1.0, output_tokens=500,
+            ))
+        assert t.suggest_model("code", 3, min_samples=10) is None
+
+    def test_suggest_returns_best_model(self, tmp_path: object) -> None:
+        from tramontane.router.telemetry import FleetTelemetry, RoutingOutcome
+
+        db = str(tmp_path) + "/test.db"  # type: ignore[operator]
+        t = FleetTelemetry(db_path=db)
+        # 15 successes for devstral-small at low cost
+        for _ in range(15):
+            t.record(RoutingOutcome(
+                task_type="code", complexity=3, model_used="devstral-small",
+                reasoning_effort=None, success=True, cost_eur=0.001,
+                latency_s=1.0, output_tokens=500,
+            ))
+        # 15 successes for devstral-2 at higher cost
+        for _ in range(15):
+            t.record(RoutingOutcome(
+                task_type="code", complexity=3, model_used="devstral-2",
+                reasoning_effort=None, success=True, cost_eur=0.005,
+                latency_s=2.0, output_tokens=1000,
+            ))
+        # Both have 100% success — devstral-small wins on cost
+        suggestion = t.suggest_model("code", 3, min_samples=10)
+        assert suggestion == "devstral-small"
+
+    def test_get_model_stats(self, tmp_path: object) -> None:
+        from tramontane.router.telemetry import FleetTelemetry, RoutingOutcome
+
+        db = str(tmp_path) + "/test.db"  # type: ignore[operator]
+        t = FleetTelemetry(db_path=db)
+        t.record(RoutingOutcome(
+            task_type="code", complexity=2, model_used="devstral-small",
+            reasoning_effort=None, success=True, cost_eur=0.001,
+            latency_s=1.0, output_tokens=500,
+        ))
+        stats = t.get_model_stats("devstral-small")
+        assert len(stats) == 1
+        assert stats[0]["total"] == 1
+
+    def test_router_without_telemetry_backward_compatible(
+        self, offline_router: MistralRouter,
+    ) -> None:
+        """Router without telemetry still works."""
+        d = offline_router.route_sync("write a function")
+        assert d.primary_model in ("devstral-small", "devstral-2")
+
+
+class TestRoutingDecisionEffort:
+    """Routing decision includes reasoning_effort."""
+
+    def test_general_task_gets_effort(self, offline_router: MistralRouter) -> None:
+        d = offline_router.route_sync("summarize this document about EU regulations")
+        # mistral-small-4 supports effort — should get one
+        if d.primary_model == "mistral-small-4":
+            assert d.reasoning_effort is not None
+
+    def test_code_task_no_effort(self, offline_router: MistralRouter) -> None:
+        d = offline_router.route_sync("write a Python sort function")
+        # devstral-small doesn't support reasoning_effort
+        if d.primary_model == "devstral-small":
+            assert d.reasoning_effort is None
+
+    def test_importable_from_package(self) -> None:
+        from tramontane import FleetTelemetry, RoutingOutcome
+
+        assert FleetTelemetry is not None
+        assert RoutingOutcome is not None

@@ -201,6 +201,8 @@ def models() -> None:
     table.add_column("EUR/1M out", justify="right", style=f"bold {_WARN}")
     table.add_column("Local")
     table.add_column("Modality", style=_STORM)
+    table.add_column("Reason", justify="center")
+    table.add_column("Vision", justify="center")
 
     for alias, m in MISTRAL_MODELS.items():
         # Tier styling: 0-1 dim, 2 normal, 3-4 bold
@@ -216,6 +218,15 @@ def models() -> None:
 
         local_str = f"[{_OK}]ollama[/]" if m.local_ollama else f"[dim {_STORM}]\u2014[/]"
 
+        reason_str = (
+            f"[{_OK}]\u2713[/]" if m.supports_reasoning_effort
+            else f"[dim {_STORM}]\u2014[/]"
+        )
+        vision_str = (
+            f"[{_OK}]\u2713[/]" if m.supports_vision
+            else f"[dim {_STORM}]\u2014[/]"
+        )
+
         table.add_row(
             name_str,
             tier_str,
@@ -224,12 +235,156 @@ def models() -> None:
             f"\u20ac{m.cost_per_1m_output_eur:.2f}",
             local_str,
             m.modality,
+            reason_str,
+            vision_str,
         )
 
     console.print(table)
     console.print(
         f"\n  [{_STORM}]Prices in EUR \u00b7 Source: Mistral AI \u00b7 Updated March 2026[/]\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# tramontane doctor
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def doctor() -> None:
+    """Health check: verify API key, connectivity, models, telemetry."""
+    import os
+
+    from tramontane.router.models import MISTRAL_MODELS
+
+    console.print()
+    console.print(Rule(title="TRAMONTANE DOCTOR", style=f"bold {_CYAN}"))
+    console.print()
+
+    checks: list[tuple[str, bool, str]] = []
+
+    # Version
+    checks.append(("Version", True, tramontane.__version__))
+
+    # API key
+    api_key = os.environ.get("MISTRAL_API_KEY", "")
+    if api_key:
+        masked = api_key[:8] + "..." + api_key[-4:]
+        checks.append(("MISTRAL_API_KEY", True, masked))
+    else:
+        checks.append(("MISTRAL_API_KEY", False, "not set"))
+
+    # Models
+    total = len(MISTRAL_MODELS)
+    available = sum(1 for m in MISTRAL_MODELS.values() if m.available)
+    checks.append(("Model fleet", True, f"{available}/{total} available"))
+
+    # Telemetry
+    try:
+        from tramontane.router.telemetry import FleetTelemetry
+
+        t = FleetTelemetry()
+        checks.append(("Telemetry DB", True, f"{t.total_outcomes} outcomes recorded"))
+    except Exception:
+        checks.append(("Telemetry DB", True, "not initialized (OK)"))
+
+    # Connectivity (quick, non-blocking)
+    if api_key:
+        try:
+            from mistralai.client import Mistral
+
+            client = Mistral(api_key=api_key)
+            resp = asyncio.run(
+                client.models.list_async()
+            )
+            count = len(resp.data) if hasattr(resp, "data") and resp.data else 0
+            checks.append(("Mistral API", True, f"connected ({count} models)"))
+        except Exception as exc:
+            checks.append(("Mistral API", False, str(exc)[:60]))
+    else:
+        checks.append(("Mistral API", False, "skipped (no API key)"))
+
+    for label, ok, detail in checks:
+        icon = f"[{_OK}]\u2713[/]" if ok else f"[{_ERR}]\u2717[/]"
+        console.print(f"  {icon} [{_FROST}]{label}[/] [{_STORM}]{detail}[/]")
+
+    console.print()
+
+
+# ---------------------------------------------------------------------------
+# tramontane fleet
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def fleet() -> None:
+    """Show fleet status with per-model telemetry stats."""
+    from tramontane.router.models import MISTRAL_MODELS
+
+    console.print()
+    console.print(Rule(title="FLEET STATUS", style=f"bold {_CYAN}"))
+    console.print()
+
+    table = Table(
+        box=box.MINIMAL_HEAVY_HEAD,
+        header_style=f"bold {_CYAN}",
+        border_style=f"dim {_RIM}",
+    )
+    table.add_column("Model", style=_FROST)
+    table.add_column("Tier", justify="center")
+    table.add_column("EUR/1M in", justify="right", style=f"bold {_WARN}")
+    table.add_column("EUR/1M out", justify="right", style=f"bold {_WARN}")
+    table.add_column("Ctx", justify="right")
+    table.add_column("Reason", justify="center")
+    table.add_column("Vision", justify="center")
+    table.add_column("Calls", justify="right")
+    table.add_column("Success", justify="right")
+
+    # Try to load telemetry stats
+    model_stats: dict[str, dict[str, object]] = {}
+    try:
+        from tramontane.router.telemetry import FleetTelemetry
+
+        t = FleetTelemetry()
+        for stat in t.get_model_stats():
+            model_stats[str(stat["model_used"])] = stat
+    except Exception:
+        pass
+
+    for alias, m in MISTRAL_MODELS.items():
+        reason_str = f"[{_OK}]\u2713[/]" if m.supports_reasoning_effort else "\u2014"
+        vision_str = f"[{_OK}]\u2713[/]" if m.supports_vision else "\u2014"
+        ctx_k = f"{m.context_window // 1000}K"
+
+        stats = model_stats.get(alias, {})
+        calls = str(stats.get("total", "\u2014"))
+        total_val = stats.get("total", 0)
+        total = int(total_val) if isinstance(total_val, (int, float)) else 0
+        succ_val = stats.get("successes", 0)
+        successes = int(succ_val) if isinstance(succ_val, (int, float)) else 0
+        rate = f"{successes / total * 100:.0f}%" if total else "\u2014"
+
+        table.add_row(
+            alias,
+            str(m.tier),
+            f"\u20ac{m.cost_per_1m_input_eur:.2f}",
+            f"\u20ac{m.cost_per_1m_output_eur:.2f}",
+            ctx_k,
+            reason_str,
+            vision_str,
+            calls,
+            rate,
+        )
+
+    console.print(table)
+
+    # Recommendations
+    console.print(f"\n  [{_CYAN}]Recommended for common tasks:[/]")
+    console.print(f"  [{_STORM}]General/Reasoning:[/] [{_FROST}]mistral-small-4[/]")
+    console.print(f"  [{_STORM}]Code:[/]             [{_FROST}]devstral-small / devstral-2[/]")
+    console.print(f"  [{_STORM}]Classification:[/]   [{_FROST}]ministral-3b[/]")
+    console.print(f"  [{_STORM}]Frontier:[/]         [{_FROST}]mistral-large-3[/]")
+    console.print()
 
 
 # ---------------------------------------------------------------------------

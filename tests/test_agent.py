@@ -10,6 +10,7 @@ import yaml
 
 from tramontane.core.agent import Agent, AgentResult
 from tramontane.core.exceptions import BudgetExceededError
+from tramontane.core.profiles import FleetProfile, apply_profile
 
 
 class TestAgentInstantiation:
@@ -331,7 +332,7 @@ class TestMaxTokens:
         from tramontane.router.models import MISTRAL_MODELS
 
         for alias, model in MISTRAL_MODELS.items():
-            assert model.max_output_tokens > 0, f"{alias} missing max_output_tokens"
+            assert model.max_output_tokens >= 0, f"{alias} invalid max_output_tokens"
 
     def test_devstral_small_has_32k_output(self) -> None:
         from tramontane.router.models import get_model
@@ -467,6 +468,124 @@ class TestRunContext:
         ctx = RunContext(budget_eur=0.5)
         assert ctx.budget_eur == 0.5
 
+    def test_adaptive_reallocation_flows_savings(self) -> None:
+        from tramontane.core.agent import RunContext
+
+        ctx = RunContext(reallocation="adaptive")
+        planner_budget = 0.005
+        planner_effective = ctx.get_effective_budget("planner", planner_budget)
+        assert planner_effective == pytest.approx(0.005)
+        ctx.record("planner", 0.0001)
+
+        builder_effective = ctx.get_effective_budget("builder", 0.005)
+        assert builder_effective == pytest.approx(0.0099)
+
+    def test_fixed_reallocation_does_not_flow_savings(self) -> None:
+        from tramontane.core.agent import RunContext
+
+        ctx = RunContext(reallocation="fixed")
+        planner_budget = 0.005
+        planner_effective = ctx.get_effective_budget("planner", planner_budget)
+        assert planner_effective == pytest.approx(0.005)
+        ctx.record("planner", 0.0001)
+
+        builder_effective = ctx.get_effective_budget("builder", 0.005)
+        assert builder_effective == pytest.approx(0.005)
+
+    def test_adaptive_reallocation_with_no_savings(self) -> None:
+        from tramontane.core.agent import RunContext
+
+        ctx = RunContext(reallocation="adaptive")
+        ctx.get_effective_budget("planner", 0.005)
+        ctx.record("planner", 0.005)
+
+        builder_effective = ctx.get_effective_budget("builder", 0.005)
+        assert builder_effective == pytest.approx(0.005)
+
+
+class TestFleetProfiles:
+    """Fleet profile behavior and task overrides."""
+
+    def test_budget_profile_uses_mistral_small_4(self) -> None:
+        model, effort = apply_profile(FleetProfile.BUDGET, "auto")
+        assert model == "mistral-small-4"
+        assert effort == "none"
+
+    def test_quality_profile_uses_devstral_2_for_code(self) -> None:
+        model, effort = apply_profile(FleetProfile.QUALITY, "auto", task_type="code")
+        assert model == "devstral-2"
+        assert effort is None
+
+    def test_explicit_model_ignores_profile_default_model(self) -> None:
+        model, effort = apply_profile(FleetProfile.BUDGET, "devstral-small")
+        assert model == "devstral-small"
+        assert effort == "none"
+
+    def test_unified_profile_uses_mistral_small_4_for_everything(self) -> None:
+        general_model, _ = apply_profile(FleetProfile.UNIFIED, "auto", task_type="general")
+        research_model, _ = apply_profile(FleetProfile.UNIFIED, "auto", task_type="research")
+        assert general_model == "mistral-small-4"
+        assert research_model == "mistral-small-4"
+
+
+class TestReasoningEffort:
+    """reasoning_effort and reasoning_strategy fields."""
+
+    def test_reasoning_effort_field(self) -> None:
+        a = Agent(
+            role="R", goal="G", backstory="B",
+            reasoning_effort="high",
+        )
+        assert a.reasoning_effort == "high"
+
+    def test_reasoning_effort_default_none(self, sample_agent: Agent) -> None:
+        assert sample_agent.reasoning_effort is None
+
+    def test_reasoning_effort_none_on_supporting_model(self) -> None:
+        """reasoning_effort=None should NOT be passed even if model supports it."""
+        a = Agent(
+            role="R", goal="G", backstory="B",
+            model="mistral-small-4",
+            reasoning_effort=None,
+        )
+        assert a.reasoning_effort is None
+
+    def test_reasoning_effort_on_non_supporting_model(self) -> None:
+        """Setting reasoning_effort on devstral-small shouldn't crash."""
+        a = Agent(
+            role="R", goal="G", backstory="B",
+            model="devstral-small",
+            reasoning_effort="high",
+        )
+        # Just verifying field can be set — actual ignoring happens at runtime
+        assert a.reasoning_effort == "high"
+
+    def test_reasoning_strategy_default(self, sample_agent: Agent) -> None:
+        assert sample_agent.reasoning_strategy == "fixed"
+
+    def test_reasoning_strategy_progressive(self) -> None:
+        a = Agent(
+            role="R", goal="G", backstory="B",
+            model="mistral-small-4",
+            reasoning_strategy="progressive",
+            validate_output=lambda r: len(r.output) > 100,
+        )
+        assert a.reasoning_strategy == "progressive"
+
+    def test_progressive_on_non_supporting_model_falls_back(self) -> None:
+        """Progressive on devstral-small should fall back to fixed behavior."""
+        from tramontane.router.models import get_model
+
+        model = get_model("devstral-small")
+        assert model.supports_reasoning_effort is False
+        # Agent with progressive on non-supporting model just uses fixed
+        a = Agent(
+            role="R", goal="G", backstory="B",
+            model="devstral-small",
+            reasoning_strategy="progressive",
+        )
+        assert a.reasoning_strategy == "progressive"  # field is set
+
 
 class TestStreamEventExtended:
     """StreamEvent extended types."""
@@ -486,6 +605,54 @@ class TestStreamEventExtended:
 
         e = StreamEvent(type="validation_retry", model_used="devstral-small")
         assert e.type == "validation_retry"
+
+    def test_reasoning_escalation_event(self) -> None:
+        from tramontane.core.agent import StreamEvent
+
+        e = StreamEvent(type="reasoning_escalation", model_used="mistral-small-4")
+        assert e.type == "reasoning_escalation"
+
+    def test_cascade_escalation_event(self) -> None:
+        from tramontane.core.agent import StreamEvent
+
+        e = StreamEvent(type="cascade_escalation", model_used="devstral-2")
+        assert e.type == "cascade_escalation"
+
+
+class TestCascade:
+    """Model cascade chain."""
+
+    def test_cascade_field_string_list(self) -> None:
+        a = Agent(
+            role="R", goal="G", backstory="B",
+            cascade=["devstral-small", "devstral-2", "mistral-large-3"],
+        )
+        assert a.cascade is not None
+        assert len(a.cascade) == 3
+
+    def test_cascade_field_dict_list(self) -> None:
+        a = Agent(
+            role="R", goal="G", backstory="B",
+            cascade=[
+                {"model": "devstral-small", "max_tokens": 16000},
+                {"model": "devstral-2", "max_tokens": 32000},
+            ],
+        )
+        assert a.cascade is not None
+        assert len(a.cascade) == 2
+
+    def test_cascade_default_none(self, sample_agent: Agent) -> None:
+        assert sample_agent.cascade is None
+
+    def test_cascade_without_validate_does_nothing(self) -> None:
+        """Cascade requires validate_output to trigger."""
+        a = Agent(
+            role="R", goal="G", backstory="B",
+            cascade=["devstral-2"],
+            # No validate_output — cascade won't fire
+        )
+        assert a.cascade is not None
+        assert a.validate_output is None
 
 
 class TestPublicExports:

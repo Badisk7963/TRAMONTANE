@@ -25,7 +25,9 @@ class MistralModel(BaseModel):
     license: str
     hf_downloads: int = 0
     max_output_tokens: int = 8192
-    modality: str = "text"  # text | audio | vision
+    modality: str = "text"  # text | audio | vision | text+vision | text-to-speech
+    supports_reasoning_effort: bool = False
+    supports_vision: bool = False
     available: bool = True
 
 
@@ -136,6 +138,40 @@ MISTRAL_MODELS: dict[str, MistralModel] = {
         strengths=["voice", "transcription", "speech-input"],
         license="MRL",
         modality="audio",
+    ),
+    "mistral-small-4": MistralModel(
+        api_id="mistral-small-2603",
+        tier=2,
+        cost_per_1m_input_eur=0.15,
+        cost_per_1m_output_eur=0.60,
+        context_window=256_000,
+        max_output_tokens=32768,
+        strengths=["general", "reasoning", "code", "vision", "multilingual"],
+        license="Apache-2.0",
+        modality="text+vision",
+        supports_reasoning_effort=True,
+        supports_vision=True,
+    ),
+    "mistral-large-3": MistralModel(
+        api_id="mistral-large-2603",
+        tier=4,
+        cost_per_1m_input_eur=2.00,
+        cost_per_1m_output_eur=6.00,
+        context_window=256_000,
+        max_output_tokens=32768,
+        strengths=["frontier", "synthesis", "reasoning", "code"],
+        license="Apache-2.0",
+    ),
+    "voxtral-tts": MistralModel(
+        api_id="voxtral-tts-2603",
+        tier=1,
+        cost_per_1m_input_eur=0.016,
+        cost_per_1m_output_eur=0.0,
+        context_window=8_192,
+        max_output_tokens=0,
+        strengths=["tts", "voice", "speech"],
+        license="CC-BY-NC-4.0",
+        modality="text-to-speech",
     ),
 }
 

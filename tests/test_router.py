@@ -146,7 +146,7 @@ class TestTaskTypeValidation:
     def test_validate_alias_design(self) -> None:
         from tramontane.router.classifier import _validate_task_type
 
-        assert _validate_task_type("design") == "general"
+        assert _validate_task_type("design") == "reasoning"
 
     def test_validate_alias_analysis(self) -> None:
         from tramontane.router.classifier import _validate_task_type
@@ -174,7 +174,7 @@ class TestTaskTypeValidation:
         from tramontane.router.classifier import _validate_task_type
 
         assert _validate_task_type("CODE") == "code"
-        assert _validate_task_type("Design") == "general"
+        assert _validate_task_type("Design") == "reasoning"
 
     def test_design_prompt_offline_returns_valid_type(
         self, offline_classifier: TaskClassifier,
@@ -193,3 +193,42 @@ class TestTaskTypeValidation:
             "compose a poem about the ocean, draft a narrative for the essay"
         )
         assert r.task_type == "general"
+
+
+class TestDesignVsVision:
+    """Design tasks must NOT route to vision (pixtral-large)."""
+
+    def test_design_system_not_vision(
+        self, offline_classifier: TaskClassifier,
+    ) -> None:
+        r = offline_classifier.classify_sync("Create a design system with warm colors")
+        assert r.task_type != "vision"
+        assert r.has_vision is False
+
+    def test_color_palette_not_vision(
+        self, offline_classifier: TaskClassifier,
+    ) -> None:
+        r = offline_classifier.classify_sync("Design a color palette for a bakery website")
+        assert r.task_type != "vision"
+
+    def test_image_analysis_is_vision(
+        self, offline_classifier: TaskClassifier,
+    ) -> None:
+        r = offline_classifier.classify_sync(
+            "Analyze this image of a website",
+            context="screenshot.png",
+        )
+        assert r.task_type == "vision"
+        assert r.has_vision is True
+
+    def test_design_alias_maps_to_reasoning(self) -> None:
+        from tramontane.router.classifier import _validate_task_type
+
+        assert _validate_task_type("design") == "reasoning"
+        assert _validate_task_type("ui_design") == "reasoning"
+        assert _validate_task_type("styling") == "code"
+
+    def test_design_prompt_routes_cheap(self, offline_router: MistralRouter) -> None:
+        """Design task should NOT route to pixtral-large (tier 4, €2/6)."""
+        d = offline_router.route_sync("Create a design system with warm colors")
+        assert d.primary_model != "pixtral-large"

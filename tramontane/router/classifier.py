@@ -35,7 +35,13 @@ VALID_TASK_TYPES: set[str] = {
 
 # Mapping for common invalid types the LLM might return
 TASK_TYPE_ALIASES: dict[str, str] = {
-    "design": "general",
+    "design": "reasoning",
+    "ui_design": "reasoning",
+    "ux_design": "reasoning",
+    "visual_design": "reasoning",
+    "color": "reasoning",
+    "layout": "reasoning",
+    "styling": "code",
     "analysis": "reasoning",
     "writing": "general",
     "translation": "general",
@@ -159,7 +165,18 @@ _CLASSIFIER_SYSTEM_PROMPT = (
     '  "estimated_output_tokens": <int>,\n'
     '  "language": "<ISO 639-1>",\n'
     '  "gdpr_sensitivity": "none"|"low"|"high"\n'
-    "}\n"
+    "}\n\n"
+    "CRITICAL — 'vision' vs 'design':\n"
+    "- 'vision' = prompt contains an IMAGE to analyze or explicitly asks "
+    "about visual content in an image. Requires multimodal model.\n"
+    "- Design tasks (create color palettes, plan layouts, choose fonts, "
+    "write CSS, create design systems) are 'reasoning' or 'code' — "
+    "they do NOT require vision capabilities.\n"
+    "Examples:\n"
+    '  "Analyze this screenshot" → vision\n'
+    '  "Create a color palette for a bakery" → reasoning\n'
+    '  "Design a UI with warm colors" → reasoning\n'
+    '  "Write CSS for a responsive grid" → code\n\n'
     "Return ONLY valid JSON, no explanations."
 )
 

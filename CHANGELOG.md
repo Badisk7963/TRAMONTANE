@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.2.0 (2026-04-01) — Battle-tested on ArkhosAI
+
+### Added
+- **Agent.routing_hint** — guides router classification when model="auto"
+  (e.g. "text-only JSON output" prevents vision misroute).
+- **Agent.temperature** — sampling temperature (0.0-1.5), passed to Mistral API.
+  `None` = model default. `0.0` valid (deterministic).
+- **Agent.validate_output** — optional callback returns True/False. On False,
+  agent auto-retries up to max_validation_retries (default 2).
+- **Agent.run() context parameter** — dynamic per-call context appended to
+  system prompt without recreating the Agent.
+- **on_pattern callback in run_stream()** — dict of {regex: callback(match, text)}.
+  Fires mid-stream when pattern matches accumulated output. Supports async callbacks.
+  Yields "pattern_match" events.
+- **RunContext** — shared cost tracker for multi-agent chains. Tracks spent_eur,
+  remaining_eur, per-agent cost breakdown. Pass to run(run_context=ctx).
+- **Per-model max_tokens defaults** — Agent auto-applies model's max_output_tokens
+  when max_tokens=None (8192 for ministral/voxtral, 32768 for others).
+- **StreamEvent.pattern_id** field + "pattern_match"/"validation_retry" event types.
+
+### Fixed
+- **Router: design → vision misclassification** — "Create a design system" no longer
+  routes to pixtral-large (€2/6 per 1M). Design tasks map to "reasoning" or "code".
+  Updated classifier system prompt with vision vs design distinction.
+  Updated TASK_TYPE_ALIASES: design/ui_design/ux_design/color/layout → reasoning,
+  styling → code.
+
+### Validated
+- 109 unit tests passing (85 → 109, +24 new)
+- ruff clean, mypy clean
+
 ## v0.1.6 (2026-04-01)
 
 ### Added

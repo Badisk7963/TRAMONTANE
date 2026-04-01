@@ -10,9 +10,11 @@ resolve model → check budget → call Mistral → track cost → return AgentR
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime
 import logging
 import os
+import re
 import time
 import uuid
 from collections.abc import AsyncGenerator
@@ -26,6 +28,33 @@ from tramontane.core.exceptions import AgentTimeoutError, BudgetExceededError
 from tramontane.router.models import MISTRAL_MODELS, MistralModel, get_model
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class RunContext:
+    """Shared context for a multi-agent pipeline run.
+
+    Tracks cumulative cost and enforces a shared budget.
+    Pass to agent.run(run_context=ctx) — spent_eur is updated
+    automatically after each call.
+    """
+
+    budget_eur: float | None = None
+    spent_eur: float = 0.0
+    run_id: str = dataclasses.field(default_factory=lambda: uuid.uuid4().hex[:12])
+    agent_costs: dict[str, float] = dataclasses.field(default_factory=dict)
+
+    @property
+    def remaining_eur(self) -> float | None:
+        """Remaining budget, or None if unlimited."""
+        if self.budget_eur is None:
+            return None
+        return max(0.0, self.budget_eur - self.spent_eur)
+
+    def record(self, agent_role: str, cost_eur: float) -> None:
+        """Record cost from an agent execution."""
+        self.spent_eur += cost_eur
+        self.agent_costs[agent_role] = self.agent_costs.get(agent_role, 0.0) + cost_eur
 
 
 class AgentResult(BaseModel):
@@ -48,11 +77,15 @@ class StreamEvent(BaseModel):
     a final 'complete' event carrying the full AgentResult.
     """
 
-    type: Literal["start", "token", "complete", "error"]
+    type: Literal[
+        "start", "token", "complete", "error",
+        "pattern_match", "validation_retry",
+    ]
     token: str = ""
     model_used: str = ""
     result: AgentResult | None = None
     error: str = ""
+    pattern_id: str = ""
 
 
 class Agent(BaseModel):
@@ -75,6 +108,9 @@ class Agent(BaseModel):
     function_calling_model: str = "auto"
     reasoning_model: str | None = None
     locale: str = "en"
+    routing_hint: str | None = None
+    """Hint for the router classifier (e.g. 'text-only JSON output').
+    Passed as context when model='auto'."""
 
     # ── TOOLS ────────────────────────────────────────────────────────
     tools: list[Any] = Field(default_factory=list)
@@ -95,6 +131,8 @@ class Agent(BaseModel):
     streaming: bool = True
     inject_date: bool = False
     allow_delegation: bool = False
+    temperature: float | None = None
+    """Sampling temperature (0.0-1.5). None = model default."""
 
     # ── MEMORY (from Agno) ───────────────────────────────────────────
     memory: bool = True
@@ -107,6 +145,13 @@ class Agent(BaseModel):
     # ── GDPR (Tramontane-unique) ─────────────────────────────────────
     gdpr_level: Literal["none", "standard", "strict"] = "none"
     store_on_cloud: bool = True
+
+    # ── OUTPUT VALIDATION ──────────────────────────────────────────
+    validate_output: Callable[[AgentResult], bool] | None = None
+    """Optional output validator. Returns True if acceptable.
+    If False, agent retries up to max_validation_retries times."""
+    max_validation_retries: int = 2
+    """Max retries when validate_output returns False."""
 
     # ── OBSERVABILITY ────────────────────────────────────────────────
     audit_actions: bool = True
@@ -216,6 +261,8 @@ class Agent(BaseModel):
         conversation_history: list[dict[str, str]] | None = None,
         run_id: str | None = None,
         spent_eur: float = 0.0,
+        run_context: RunContext | None = None,
+        context: str | None = None,
     ) -> AgentResult:
         """Execute this agent: resolve model, call Mistral, return result.
 
@@ -229,6 +276,8 @@ class Agent(BaseModel):
             conversation_history: Prior messages to include as context.
             run_id: Trace identifier (generated if not provided).
             spent_eur: Total already spent by Pipeline (for budget check).
+            run_context: Shared RunContext for multi-agent cost tracking.
+            context: Dynamic per-call context appended to system prompt.
 
         Returns:
             AgentResult with output, model, tokens, cost, duration.
@@ -237,6 +286,47 @@ class Agent(BaseModel):
             BudgetExceededError: If estimated cost exceeds remaining budget.
             AgentTimeoutError: If max_execution_time is exceeded.
         """
+        result: AgentResult | None = None
+        for validation_attempt in range(
+            (self.max_validation_retries + 1) if self.validate_output else 1,
+        ):
+            result = await self._run_once(
+                input_text,
+                router=router,
+                conversation_history=conversation_history,
+                run_id=run_id,
+                spent_eur=run_context.spent_eur if run_context else spent_eur,
+                context=context,
+            )
+            if self.validate_output is None or self.validate_output(result):
+                break
+            if validation_attempt < self.max_validation_retries:
+                logger.warning(
+                    "Output validation failed for %s (attempt %d/%d), retrying",
+                    self.role, validation_attempt + 1, self.max_validation_retries,
+                )
+            else:
+                logger.warning(
+                    "Output validation failed for %s after %d retries, "
+                    "accepting last result",
+                    self.role, self.max_validation_retries,
+                )
+        assert result is not None  # noqa: S101
+        if run_context:
+            run_context.record(self.role, result.cost_eur)
+        return result
+
+    async def _run_once(
+        self,
+        input_text: str,
+        *,
+        router: Any | None = None,
+        conversation_history: list[dict[str, str]] | None = None,
+        run_id: str | None = None,
+        spent_eur: float = 0.0,
+        context: str | None = None,
+    ) -> AgentResult:
+        """Execute a single Mistral API call (no validation retry loop)."""
         import anyio
         from mistralai.client import Mistral
 
@@ -258,6 +348,7 @@ class Agent(BaseModel):
                 prompt=input_text,
                 agent_budget_eur=self.budget_eur,
                 locale=self.locale,
+                context=self.routing_hint,
             )
             model_alias = routing_decision.primary_model
 
@@ -265,8 +356,11 @@ class Agent(BaseModel):
         api_model = model_info.api_id if model_info else model_alias
 
         # 2. Build messages
+        sys_prompt = self.system_prompt()
+        if context:
+            sys_prompt += f"\n\n## Additional Context\n{context}"
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": self.system_prompt()},
+            {"role": "system", "content": sys_prompt},
         ]
         if conversation_history:
             messages.extend(conversation_history)
@@ -288,12 +382,19 @@ class Agent(BaseModel):
         max_retries = self.max_retry_limit
         response: Any = None
 
+        # Resolve effective max_tokens: explicit > model default
+        effective_max_tokens = self.max_tokens
+        if effective_max_tokens is None and model_info:
+            effective_max_tokens = model_info.max_output_tokens
+
         chat_kwargs: dict[str, Any] = {
             "model": api_model,
             "messages": messages,
         }
-        if self.max_tokens is not None:
-            chat_kwargs["max_tokens"] = self.max_tokens
+        if effective_max_tokens is not None:
+            chat_kwargs["max_tokens"] = effective_max_tokens
+        if self.temperature is not None:
+            chat_kwargs["temperature"] = self.temperature
 
         for attempt in range(max_retries + 1):
             try:
@@ -376,6 +477,9 @@ class Agent(BaseModel):
         conversation_history: list[dict[str, str]] | None = None,
         run_id: str | None = None,
         spent_eur: float = 0.0,
+        run_context: RunContext | None = None,
+        context: str | None = None,
+        on_pattern: dict[str, Callable[..., Any]] | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Execute this agent with token-by-token streaming.
 
@@ -383,18 +487,20 @@ class Agent(BaseModel):
         The final event has type="complete" with a full AgentResult.
         Errors are yielded as type="error" events (never raised).
 
-        Same pre-flight as run(): model resolution, budget check,
-        message building. Post-stream actual cost uses real token counts.
-
         Args:
             input_text: The user/handoff message to process.
             router: Optional MistralRouter for model="auto" resolution.
             conversation_history: Prior messages to include as context.
             run_id: Trace identifier (generated if not provided).
             spent_eur: Total already spent by Pipeline (for budget check).
+            run_context: Shared RunContext for multi-agent cost tracking.
+            context: Dynamic per-call context appended to system prompt.
+            on_pattern: Dict of {regex: callback(match, text)}. Fires when
+                pattern matches accumulated output mid-stream.
 
         Yields:
-            StreamEvent with type in ("start", "token", "complete", "error").
+            StreamEvent with type in start/token/complete/error/pattern_match/
+            validation_retry.
         """
         import anyio
         from mistralai.client import Mistral
@@ -414,6 +520,7 @@ class Agent(BaseModel):
             return
 
         rid = run_id or uuid.uuid4().hex[:12]
+        effective_spent = run_context.spent_eur if run_context else spent_eur
 
         # 1. Resolve model
         model_alias = self.model
@@ -423,6 +530,7 @@ class Agent(BaseModel):
                     prompt=input_text,
                     agent_budget_eur=self.budget_eur,
                     locale=self.locale,
+                    context=self.routing_hint,
                 )
                 model_alias = routing_decision.primary_model
             except Exception as exc:
@@ -433,8 +541,11 @@ class Agent(BaseModel):
         api_model = model_info.api_id if model_info else model_alias
 
         # 2. Build messages
+        sys_prompt = self.system_prompt()
+        if context:
+            sys_prompt += f"\n\n## Additional Context\n{context}"
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": self.system_prompt()},
+            {"role": "system", "content": sys_prompt},
         ]
         if conversation_history:
             messages.extend(conversation_history)
@@ -444,7 +555,7 @@ class Agent(BaseModel):
         if model_info:
             est_cost = self._estimate_call_cost(messages, model_info)
             try:
-                self.check_budget(est_cost, spent_eur=spent_eur)
+                self.check_budget(est_cost, spent_eur=effective_spent)
             except BudgetExceededError as exc:
                 yield StreamEvent(type="error", error=str(exc))
                 return
@@ -458,94 +569,138 @@ class Agent(BaseModel):
             )
             return
 
-        # 5. Yield start event
-        yield StreamEvent(type="start", model_used=model_alias)
+        # 5. Compile patterns once
+        compiled_patterns: list[tuple[re.Pattern[str], Callable[..., Any]]] = []
+        if on_pattern:
+            compiled_patterns = [
+                (re.compile(pattern), callback)
+                for pattern, callback in on_pattern.items()
+            ]
 
-        # 6. Stream from Mistral with retry + backoff + timeout
-        client = Mistral(api_key=api_key)
-        start_time = time.monotonic()
-        full_output = ""
-        input_tokens = 0
-        output_tokens = 0
-        tokens_yielded = False
+        # 6. Resolve effective max_tokens
+        effective_max_tokens = self.max_tokens
+        if effective_max_tokens is None and model_info:
+            effective_max_tokens = model_info.max_output_tokens
 
         stream_kwargs: dict[str, Any] = {
             "model": api_model,
             "messages": messages,
         }
-        if self.max_tokens is not None:
-            stream_kwargs["max_tokens"] = self.max_tokens
+        if effective_max_tokens is not None:
+            stream_kwargs["max_tokens"] = effective_max_tokens
+        if self.temperature is not None:
+            stream_kwargs["temperature"] = self.temperature
 
-        for attempt in range(self.max_retry_limit + 1):
-            try:
-                stream = await client.chat.stream_async(**stream_kwargs)
-                async with stream as event_stream:
-                    async for event in event_stream:
-                        # Timeout guard (CLAUDE.md failure mode #5)
-                        if self.max_execution_time:
-                            elapsed = time.monotonic() - start_time
-                            if elapsed > self.max_execution_time:
-                                yield StreamEvent(
-                                    type="error",
-                                    error=(
-                                        f"Agent '{self.role}' timed out after "
-                                        f"{self.max_execution_time}s"
-                                    ),
-                                )
-                                return
-
-                        chunk = event.data
-                        if chunk.choices:
-                            delta = chunk.choices[0].delta
-                            token_text = str(delta.content) if delta.content else ""
-                            if token_text:
-                                full_output += token_text
-                                tokens_yielded = True
-                                yield StreamEvent(
-                                    type="token",
-                                    token=token_text,
-                                    model_used=model_alias,
-                                )
-                        # Final chunk carries usage info
-                        if chunk.usage:
-                            input_tokens = chunk.usage.prompt_tokens or 0
-                            output_tokens = chunk.usage.completion_tokens or 0
-                break  # success
-
-            except Exception as exc:
-                # Never retry after tokens were already sent to consumer
-                # (can't un-yield — would produce duplicated/corrupt output)
-                if tokens_yielded or attempt >= self.max_retry_limit:
-                    yield StreamEvent(type="error", error=str(exc))
-                    return
-                wait = min(2 ** attempt, 30)
-                logger.warning(
-                    "[%s] Stream error (attempt %d/%d): %s — retrying in %ds",
-                    rid, attempt + 1, self.max_retry_limit + 1, exc, wait,
+        # 7. Validation retry loop (re-streams if output fails validation)
+        max_val_attempts = (
+            (self.max_validation_retries + 1) if self.validate_output else 1
+        )
+        for val_attempt in range(max_val_attempts):
+            if val_attempt > 0:
+                yield StreamEvent(
+                    type="validation_retry", model_used=model_alias,
                 )
-                await anyio.sleep(wait)
 
-        duration = time.monotonic() - start_time
+            # Yield start event
+            yield StreamEvent(type="start", model_used=model_alias)
 
-        # 7. Calculate actual cost
-        actual_cost = 0.0
-        if model_info:
-            actual_cost = (
-                (input_tokens / 1_000_000) * model_info.cost_per_1m_input_eur
-                + (output_tokens / 1_000_000) * model_info.cost_per_1m_output_eur
+            # 8. Stream from Mistral with retry + backoff + timeout
+            client = Mistral(api_key=api_key)
+            start_time = time.monotonic()
+            full_output = ""
+            input_tokens = 0
+            output_tokens = 0
+            tokens_yielded = False
+            last_checked: dict[str, int] = {}
+
+            for attempt in range(self.max_retry_limit + 1):
+                try:
+                    stream = await client.chat.stream_async(**stream_kwargs)
+                    async with stream as event_stream:
+                        async for event in event_stream:
+                            # Timeout guard (CLAUDE.md failure mode #5)
+                            if self.max_execution_time:
+                                elapsed = time.monotonic() - start_time
+                                if elapsed > self.max_execution_time:
+                                    yield StreamEvent(
+                                        type="error",
+                                        error=(
+                                            f"Agent '{self.role}' timed out "
+                                            f"after {self.max_execution_time}s"
+                                        ),
+                                    )
+                                    return
+
+                            chunk = event.data
+                            if chunk.choices:
+                                delta = chunk.choices[0].delta
+                                token_text = (
+                                    str(delta.content) if delta.content else ""
+                                )
+                                if token_text:
+                                    full_output += token_text
+                                    tokens_yielded = True
+                                    yield StreamEvent(
+                                        type="token",
+                                        token=token_text,
+                                        model_used=model_alias,
+                                    )
+                                    # Check patterns
+                                    for pat, cb in compiled_patterns:
+                                        pkey = pat.pattern
+                                        start_pos = last_checked.get(pkey, 0)
+                                        search_from = max(0, start_pos - 100)
+                                        for m in pat.finditer(
+                                            full_output, search_from,
+                                        ):
+                                            if m.start() >= start_pos:
+                                                result = cb(m, full_output)
+                                                if asyncio.iscoroutine(result):
+                                                    await result
+                                                yield StreamEvent(
+                                                    type="pattern_match",
+                                                    model_used=model_alias,
+                                                    pattern_id=pkey,
+                                                )
+                                        last_checked[pkey] = len(full_output)
+                            # Final chunk carries usage info
+                            if chunk.usage:
+                                input_tokens = (
+                                    chunk.usage.prompt_tokens or 0
+                                )
+                                output_tokens = (
+                                    chunk.usage.completion_tokens or 0
+                                )
+                    break  # success
+
+                except Exception as exc:
+                    if tokens_yielded or attempt >= self.max_retry_limit:
+                        yield StreamEvent(type="error", error=str(exc))
+                        return
+                    wait = min(2 ** attempt, 30)
+                    logger.warning(
+                        "[%s] Stream error (attempt %d/%d): %s — retrying in %ds",
+                        rid, attempt + 1, self.max_retry_limit + 1, exc, wait,
+                    )
+                    await anyio.sleep(wait)
+
+            duration = time.monotonic() - start_time
+
+            # 9. Calculate actual cost
+            actual_cost = 0.0
+            if model_info:
+                actual_cost = (
+                    (input_tokens / 1_000_000) * model_info.cost_per_1m_input_eur
+                    + (output_tokens / 1_000_000) * model_info.cost_per_1m_output_eur
+                )
+
+            logger.debug(
+                "[%s] stream agent=%s model=%s tokens=%d/%d cost=EUR %.6f dur=%.2fs",
+                rid, self.role, model_alias, input_tokens, output_tokens,
+                actual_cost, duration,
             )
 
-        logger.debug(
-            "[%s] stream agent=%s model=%s tokens=%d/%d cost=EUR %.6f dur=%.2fs",
-            rid, self.role, model_alias, input_tokens, output_tokens,
-            actual_cost, duration,
-        )
-
-        # 8. Yield complete event with full AgentResult
-        yield StreamEvent(
-            type="complete",
-            model_used=model_alias,
-            result=AgentResult(
+            result = AgentResult(
                 output=full_output,
                 model_used=model_alias,
                 input_tokens=input_tokens,
@@ -554,7 +709,30 @@ class Agent(BaseModel):
                 duration_seconds=round(duration, 3),
                 tool_calls=[],
                 reasoning_used=self.reasoning,
-            ),
+            )
+
+            # 10. Validation check
+            if self.validate_output is None or self.validate_output(result):
+                break
+            if val_attempt < self.max_validation_retries:
+                logger.warning(
+                    "Stream output validation failed for %s (attempt %d/%d)",
+                    self.role, val_attempt + 1, self.max_validation_retries,
+                )
+            else:
+                logger.warning(
+                    "Stream output validation failed for %s after %d retries",
+                    self.role, self.max_validation_retries,
+                )
+
+        if run_context:
+            run_context.record(self.role, result.cost_eur)
+
+        # 11. Yield complete event
+        yield StreamEvent(
+            type="complete",
+            model_used=model_alias,
+            result=result,
         )
 
     def _estimate_call_cost(

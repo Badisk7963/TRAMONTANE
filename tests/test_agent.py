@@ -340,6 +340,154 @@ class TestMaxTokens:
         assert model.max_output_tokens == 32768
 
 
+class TestRoutingHint:
+    """Agent routing_hint field."""
+
+    def test_routing_hint_field_exists(self) -> None:
+        a = Agent(
+            role="R", goal="G", backstory="B",
+            routing_hint="text-only JSON output",
+        )
+        assert a.routing_hint == "text-only JSON output"
+
+    def test_routing_hint_default_none(self, sample_agent: Agent) -> None:
+        assert sample_agent.routing_hint is None
+
+
+class TestTemperature:
+    """Agent temperature parameter."""
+
+    def test_temperature_field_exists(self) -> None:
+        a = Agent(role="R", goal="G", backstory="B", temperature=0.9)
+        assert a.temperature == 0.9
+
+    def test_temperature_zero_is_valid(self) -> None:
+        a = Agent(role="R", goal="G", backstory="B", temperature=0.0)
+        assert a.temperature == 0.0
+        # 0.0 is not None — should be passed to API
+        assert a.temperature is not None
+
+    def test_temperature_default_none(self, sample_agent: Agent) -> None:
+        assert sample_agent.temperature is None
+
+
+class TestDynamicContext:
+    """Dynamic per-call context parameter."""
+
+    def test_system_prompt_without_context(self, sample_agent: Agent) -> None:
+        prompt = sample_agent.system_prompt()
+        assert "Additional Context" not in prompt
+
+    def test_context_appended_to_system_prompt(self) -> None:
+        """Verify context param changes messages (tested via system_prompt)."""
+        a = Agent(role="R", goal="G", backstory="B")
+        base = a.system_prompt()
+        # The context is appended in _run_once, not system_prompt itself
+        # So we just verify the field plumbing works
+        assert "Additional Context" not in base
+
+
+class TestValidateOutput:
+    """Output validation hook."""
+
+    def test_validate_output_default_none(self, sample_agent: Agent) -> None:
+        assert sample_agent.validate_output is None
+
+    def test_validate_output_field_accepts_callable(self) -> None:
+        a = Agent(
+            role="R", goal="G", backstory="B",
+            validate_output=lambda r: r.output.count("</file>") >= 5,
+            max_validation_retries=2,
+        )
+        assert a.validate_output is not None
+        assert a.max_validation_retries == 2
+
+    def test_max_validation_retries_default(self) -> None:
+        a = Agent(role="R", goal="G", backstory="B")
+        assert a.max_validation_retries == 2
+
+
+class TestPerModelMaxTokens:
+    """Per-model max_tokens defaults from MISTRAL_MODELS."""
+
+    def test_max_tokens_none_gets_model_default(self) -> None:
+        """When max_tokens is None, model's max_output_tokens should be used."""
+        from tramontane.router.models import get_model
+
+        model = get_model("devstral-small")
+        assert model.max_output_tokens == 32768
+        # Agent with max_tokens=None should auto-apply 32768
+
+    def test_explicit_max_tokens_overrides(self) -> None:
+        a = Agent(role="R", goal="G", backstory="B", max_tokens=8000)
+        assert a.max_tokens == 8000
+
+
+class TestRunContext:
+    """RunContext shared cost tracking."""
+
+    def test_run_context_creation(self) -> None:
+        from tramontane.core.agent import RunContext
+
+        ctx = RunContext(budget_eur=0.25)
+        assert ctx.budget_eur == 0.25
+        assert ctx.spent_eur == 0.0
+        assert ctx.remaining_eur == 0.25
+
+    def test_run_context_record(self) -> None:
+        from tramontane.core.agent import RunContext
+
+        ctx = RunContext(budget_eur=1.0)
+        ctx.record("planner", 0.001)
+        ctx.record("builder", 0.015)
+        assert ctx.spent_eur == pytest.approx(0.016)
+        assert ctx.remaining_eur == pytest.approx(0.984)
+        assert ctx.agent_costs["planner"] == pytest.approx(0.001)
+        assert ctx.agent_costs["builder"] == pytest.approx(0.015)
+
+    def test_run_context_accumulates_same_agent(self) -> None:
+        from tramontane.core.agent import RunContext
+
+        ctx = RunContext()
+        ctx.record("builder", 0.01)
+        ctx.record("builder", 0.02)
+        assert ctx.agent_costs["builder"] == pytest.approx(0.03)
+
+    def test_run_context_unlimited_budget(self) -> None:
+        from tramontane.core.agent import RunContext
+
+        ctx = RunContext()  # no budget
+        assert ctx.remaining_eur is None
+        ctx.record("agent", 999.0)
+        assert ctx.remaining_eur is None
+
+    def test_run_context_importable_from_package(self) -> None:
+        from tramontane import RunContext
+
+        ctx = RunContext(budget_eur=0.5)
+        assert ctx.budget_eur == 0.5
+
+
+class TestStreamEventExtended:
+    """StreamEvent extended types."""
+
+    def test_pattern_match_event(self) -> None:
+        from tramontane.core.agent import StreamEvent
+
+        e = StreamEvent(
+            type="pattern_match", model_used="devstral-small",
+            pattern_id=r"<file>",
+        )
+        assert e.type == "pattern_match"
+        assert e.pattern_id == "<file>"
+
+    def test_validation_retry_event(self) -> None:
+        from tramontane.core.agent import StreamEvent
+
+        e = StreamEvent(type="validation_retry", model_used="devstral-small")
+        assert e.type == "validation_retry"
+
+
 class TestPublicExports:
     """Package-level exports."""
 

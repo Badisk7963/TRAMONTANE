@@ -168,7 +168,7 @@ async for event in agent.run_stream(
 
 ## Built With Tramontane
 
-- **ArkhosAI** — EU answer to Lovable. 4-agent website generator, EUR 0.004/generation.
+- **ArkhosAI** — 4-agent website generator, EUR 0.004/generation.
 - **Gerald** — Autonomous business operations agent. Lead gen + social media + weekly briefs.
 
 ## GDPR Native

